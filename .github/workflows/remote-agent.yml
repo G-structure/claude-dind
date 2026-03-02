@@ -81,6 +81,13 @@ jobs:
           cargo build --release --bin gwp
           sudo cp target/release/gwp /usr/local/bin/gwp
 
+      - name: Pre-pull images
+        if: inputs.loom == 'true'
+        run: |
+          # Pre-pull alpine so the blob purge container doesn't stall
+          # waiting for a pull through the gwp tunnel during checkpoints
+          docker pull alpine:latest
+
       - name: Build Docker image
         run: |
           docker build -t ${{ inputs.image }} docker/
