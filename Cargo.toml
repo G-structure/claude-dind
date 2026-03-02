@@ -15,8 +15,17 @@ path = "src/main.rs"
 anyhow = "1"
 # CLI argument parsing with derive macros — generates --help, validation, etc. from struct fields
 clap = { version = "4", features = ["derive"] }
-# JSON serialization framework (serde is pulled in by serde_json, but we declare it
-# explicitly for clarity and in case we add typed deserialization later)
+# Terminal event handling for the TUI multiplexer
+crossterm = "0.28"
+# TUI framework for rendering the multiplexer interface
+ratatui = "0.29"
+# JSON serialization framework
 serde = { version = "1", features = ["derive"] }
 # JSON parsing for validating the credential blob structure before piping it to Docker
 serde_json = "1"
+# Headless terminal emulation for wrapping docker exec sessions
+shadow-terminal = { path = "extern/shadow-terminal/shadow-terminal" }
+# Re-export of termwiz from shadow-terminal for Surface types
+termwiz = { package = "tattoy-termwiz", version = "=0.24.0-fork.2", features = ["use_serde"] }
+# Async runtime for shadow-terminal and the TUI event loop
+tokio = { version = "1", features = ["full"] }

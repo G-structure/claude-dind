@@ -2,22 +2,30 @@
 # entrypoint.sh — Container entrypoint for claude-dind
 #
 # This script is the first thing that runs when the container starts.
-# It orchestrates five phases:
+# It supports two modes, controlled by the CLAUDE_MODE env var:
 #
-#   Phase 1: Read OAuth credential JSON from stdin (piped by the Rust CLI)
-#   Phase 2: Write credentials to ~/.claude/.credentials.json (Linux credential path)
-#   Phase 3: Start the Docker daemon in the background (DinD)
-#   Phase 4: Run Claude Code as the non-root 'claude' user
-#   Phase 5: Clean up credentials and stop dockerd
+# CLAUDE_MODE=prompt (default):
+#   Orchestrates five phases:
+#     Phase 1: Read OAuth credential JSON from stdin (piped by the Rust CLI)
+#     Phase 2: Write credentials to ~/.claude/.credentials.json
+#     Phase 3: Start the Docker daemon in the background (DinD)
+#     Phase 4: Run Claude Code as the non-root 'claude' user
+#     Phase 5: Clean up credentials and stop dockerd
 #
-# Stdin protocol:
+# CLAUDE_MODE=interactive:
+#   Starts dockerd and then sleeps forever. Claude sessions are spawned
+#   via `docker exec` by the host-side multiplexer. Credentials are
+#   injected separately via `docker exec` after startup.
+#
+# Stdin protocol (prompt mode only):
 #   The Rust CLI writes the full credential JSON blob to this container's stdin,
 #   then closes the pipe (sends EOF). This script reads stdin with `cat`, which
 #   blocks until EOF. Since the Rust CLI closes the pipe immediately after writing,
 #   `cat` returns instantly with the full JSON.
 #
 # Environment variables (set by the Rust CLI via `docker run --env`):
-#   CLAUDE_PROMPT  — Required. The prompt/task to pass to `claude -p`.
+#   CLAUDE_MODE    — Optional. "prompt" (default) or "interactive".
+#   CLAUDE_PROMPT  — Required in prompt mode. The prompt/task to pass to `claude -p`.
 #   CLAUDE_FLAGS   — Optional. Extra flags appended to the `claude` command.
 #
 # Exit codes:
@@ -28,7 +36,67 @@
 
 set -euo pipefail
 
-echo "[claude-dind] Starting..." >&2
+CLAUDE_MODE="${CLAUDE_MODE:-prompt}"
+echo "[claude-dind] Starting (mode: ${CLAUDE_MODE})..." >&2
+
+# ── Phase 3 (always): Start dockerd in background (DinD) ─────────────────
+#
+# The docker:dind image includes `dockerd-entrypoint.sh` which handles
+# storage driver setup, TLS certificate generation, and containerd startup.
+# We run it in the background and poll `docker info` until the daemon is ready.
+#
+# The container must be started with `--privileged` for this to work — dockerd
+# needs capabilities like SYS_ADMIN, NET_ADMIN, and access to cgroups.
+#
+# In interactive mode, dockerd must start first before we sleep. Credentials
+# and sessions are injected later via `docker exec`.
+
+echo "[claude-dind] Starting Docker daemon..." >&2
+dockerd-entrypoint.sh dockerd &
+DOCKERD_PID=$!
+
+# Poll until dockerd is ready (or timeout after 30 seconds).
+# On OrbStack: typically <1s. On Docker Desktop: 2-5s.
+TIMEOUT=30
+ELAPSED=0
+while ! docker info > /dev/null 2>&1; do
+    if [ $ELAPSED -ge $TIMEOUT ]; then
+        echo "[claude-dind] ERROR: dockerd failed to start within ${TIMEOUT}s" >&2
+        exit 3
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+echo "[claude-dind] Docker daemon ready (took ${ELAPSED}s)." >&2
+
+# ── Interactive mode: sleep forever ──────────────────────────────────────
+#
+# In interactive mode, the container stays alive. The host-side multiplexer
+# creates Claude sessions via `docker exec` and injects credentials separately.
+# We trap SIGTERM/SIGINT for graceful shutdown.
+
+if [ "$CLAUDE_MODE" = "interactive" ]; then
+    echo "[claude-dind] Interactive mode — container ready for sessions." >&2
+    echo "[claude-dind] Use 'docker exec' to create sessions." >&2
+
+    # Trap signals for graceful shutdown
+    cleanup() {
+        echo "[claude-dind] Shutting down..." >&2
+        kill $DOCKERD_PID 2>/dev/null || true
+        wait $DOCKERD_PID 2>/dev/null || true
+        exit 0
+    }
+    trap cleanup SIGTERM SIGINT
+
+    # Sleep forever (exec replaces shell, PID 1 = sleep)
+    # Using a loop so signals are handled between iterations
+    while true; do
+        sleep 86400 &
+        wait $! || true
+    done
+fi
+
+# ── Prompt mode: the original behavior ────────────────────────────────────
 
 # ── Phase 1: Read credentials from stdin ──────────────────────────────────
 #
@@ -74,33 +142,6 @@ mkdir -p /home/claude/.claude
 echo "$CREDS_JSON" > /home/claude/.claude/.credentials.json
 chmod 600 /home/claude/.claude/.credentials.json
 chown -R claude:claude /home/claude/.claude
-
-# ── Phase 3: Start dockerd in background (DinD) ──────────────────────────
-#
-# The docker:dind image includes `dockerd-entrypoint.sh` which handles
-# storage driver setup, TLS certificate generation, and containerd startup.
-# We run it in the background and poll `docker info` until the daemon is ready.
-#
-# The container must be started with `--privileged` for this to work — dockerd
-# needs capabilities like SYS_ADMIN, NET_ADMIN, and access to cgroups.
-
-echo "[claude-dind] Starting Docker daemon..." >&2
-dockerd-entrypoint.sh dockerd &
-DOCKERD_PID=$!
-
-# Poll until dockerd is ready (or timeout after 30 seconds).
-# On OrbStack: typically <1s. On Docker Desktop: 2-5s.
-TIMEOUT=30
-ELAPSED=0
-while ! docker info > /dev/null 2>&1; do
-    if [ $ELAPSED -ge $TIMEOUT ]; then
-        echo "[claude-dind] ERROR: dockerd failed to start within ${TIMEOUT}s" >&2
-        exit 3
-    fi
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-echo "[claude-dind] Docker daemon ready (took ${ELAPSED}s)." >&2
 
 # ── Phase 4: Run Claude Code ─────────────────────────────────────────────
 #
