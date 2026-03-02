@@ -24,7 +24,9 @@ use anyhow::Result;
 use clap::Parser;
 
 mod agent;
+mod http_connect;
 mod relay;
+mod reverse;
 mod serve;
 mod socks5;
 mod tls;
