@@ -29,3 +29,27 @@ shadow-terminal = { path = "extern/shadow-terminal/shadow-terminal" }
 termwiz = { package = "tattoy-termwiz", version = "=0.24.0-fork.2", features = ["use_serde"] }
 # Async runtime for shadow-terminal and the TUI event loop
 tokio = { version = "1", features = ["full"] }
+# Reverse SOCKS5 tunnel for remote loom sessions (gwp)
+gh-worker-proxy = { path = "extern/gh-worker-proxy" }
+# TLS for gwp tunnel
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Self-signed cert generation for gwp
+rcgen = "0.14"
+# Stream multiplexer for gwp tunnel
+yamux = "0.13"
+# Trait bridging between tokio and futures IO
+tokio-util = { version = "0.7", features = ["compat"] }
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Random token generation
+rand = "0.8"
+# SHA-256 fingerprint computation
+sha2 = "0.10"
+# Hex encoding for fingerprints and tokens
+hex = "0.4"
+# Futures combinators for yamux stream handling
+futures = "0.3"
+# WebSocket relay support
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }

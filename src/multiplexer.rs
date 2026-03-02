@@ -13,6 +13,15 @@
 //! 3. **Session lifecycle** — Detects when session processes exit and marks
 //!    them as dead. Exits the loop when all sessions end or the user detaches.
 //!
+//! ## Loom (Checkpoint) Support
+//!
+//! When `--loom` is active, additional modes and keybindings are available:
+//!
+//! - `Ctrl-b s` — Take a checkpoint snapshot (opens label input)
+//! - `Ctrl-b t` — Toggle the checkpoint tree view
+//! - TreeView mode: `j/k` navigate, `Enter` restore, `d` delete, `q/Esc` back
+//! - LabelInput mode: type label, `Enter` confirm, `Esc` cancel
+//!
 //! ## Input State Machine
 //!
 //! ```text
@@ -21,12 +30,12 @@
 //!  │          │ <──────── │          │
 //!  └──────────┘  any key  └──────────┘
 //!       │                      │
-//!       │   ?                  │
-//!       │   ┌──────────┐      │
-//!       └──>│   Help   │<─────┘
-//!           │          │
-//!           └──────────┘
-//!            any key → Normal
+//!       │   ?                  │ s/t
+//!       │   ┌──────────┐      │    ┌────────────┐   ┌────────────┐
+//!       └──>│   Help   │<─────┘    │  TreeView  │   │ LabelInput │
+//!           │          │           │            │   │            │
+//!           └──────────┘           └────────────┘   └────────────┘
+//!            any key → Normal       q/Esc → Normal   Enter/Esc → Normal
 //! ```
 //!
 //! ## Frame Rate
@@ -49,18 +58,20 @@ use ratatui::Terminal;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write as _;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::container::ContainerManager;
-use crate::render;
+use crate::loom::LoomTree;
+use crate::loom_render::TreeViewState;
+use crate::render::{self, ViewMode};
 use crate::session::SessionManager;
 
 /// The prefix key state machine for input handling.
 ///
 /// In normal mode, all keystrokes are forwarded to the active session.
 /// Pressing Ctrl-b enters prefix mode, where the next key is interpreted
-/// as a multiplexer command. The help overlay is a third state where any
-/// key dismisses it and returns to normal mode.
+/// as a multiplexer command. Additional modes support loom operations.
 enum InputMode {
     /// Normal mode: all input goes to the active session, except the prefix key.
     Normal,
@@ -68,6 +79,10 @@ enum InputMode {
     Prefix,
     /// Help overlay is shown; any key dismisses it.
     Help,
+    /// Tree view is shown; j/k navigate, Enter restores, d deletes, q/Esc exits.
+    TreeView,
+    /// Label input for naming a new checkpoint.
+    LabelInput,
 }
 
 /// Result of processing a key event in prefix mode.
@@ -92,6 +107,10 @@ enum PrefixAction {
     /// `Ctrl-b` — The prefix key was pressed again; send a literal 0x02 byte
     /// to the active session (escape hatch for programs that use Ctrl-b).
     SendPrefix,
+    /// `s` — Take a snapshot (checkpoint). Only when loom is active.
+    TakeSnapshot,
+    /// `t` — Show the checkpoint tree. Only when loom is active.
+    ShowTree,
     /// Any other key — ignore and return to normal mode.
     Ignore,
 }
@@ -119,7 +138,28 @@ enum PrefixAction {
 /// - `container` — The running container to create sessions in
 /// - `detach_on_exit` — If true, exit the loop when all sessions end instead of
 ///   keeping the TUI alive waiting for new sessions
-pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<bool> {
+/// - `creds_json` — Credentials JSON for re-injection after checkpoint/restore (None if no loom)
+/// - `loom_path` — Path to the loom tree JSON file (None if no loom)
+/// - `verbose` — Enable verbose logging
+pub async fn run(
+    container: &ContainerManager,
+    detach_on_exit: bool,
+    creds_json: Option<&str>,
+    loom_path: Option<&Path>,
+    verbose: bool,
+) -> Result<bool> {
+    run_with_host(container, detach_on_exit, creds_json, loom_path, verbose, None).await
+}
+
+/// Main entry point for the interactive multiplexer TUI, with optional remote Docker host.
+pub async fn run_with_host(
+    container: &ContainerManager,
+    detach_on_exit: bool,
+    creds_json: Option<&str>,
+    loom_path: Option<&Path>,
+    verbose: bool,
+    docker_host: Option<&str>,
+) -> Result<bool> {
     // Open a log file for debugging (append mode)
     let mut log = OpenOptions::new()
         .create(true)
@@ -146,6 +186,20 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
 
     log!("Starting multiplexer for container {}", container.short_id());
 
+    // Loom state
+    let loom_active = loom_path.is_some();
+    let mut loom_tree = if let Some(path) = loom_path {
+        LoomTree::load_or_create(path)?
+    } else {
+        LoomTree::default()
+    };
+    let mut tree_state = TreeViewState::new();
+    let mut label_buffer = String::new();
+
+    if loom_active {
+        log!("Loom active, {} existing checkpoints", loom_tree.len());
+    }
+
     // Set up terminal
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -158,7 +212,10 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
     let size = terminal.size().context("Failed to get terminal size")?;
     log!("Terminal size: {}x{}", size.width, size.height);
 
-    let mut sessions = SessionManager::new(container.container_id.clone());
+    let mut sessions = SessionManager::new_with_host(
+        container.container_id.clone(),
+        docker_host.map(|s| s.to_string()),
+    );
     let mut mode = InputMode::Normal;
     let mut detached = false;
 
@@ -187,9 +244,36 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
             }
         }
 
+        // Determine current view mode for rendering
+        let view_mode = match mode {
+            InputMode::TreeView => ViewMode::TreeView,
+            InputMode::LabelInput => ViewMode::LabelInput,
+            _ => ViewMode::Terminal,
+        };
+
+        let loom_ref = if loom_active { Some(&loom_tree) } else { None };
+        let tree_ref = if matches!(mode, InputMode::TreeView) {
+            Some(&tree_state)
+        } else {
+            None
+        };
+        let label_ref = if matches!(mode, InputMode::LabelInput) {
+            Some(label_buffer.as_str())
+        } else {
+            None
+        };
+
         // Render
         terminal.draw(|frame| {
-            render::render_frame(frame, &sessions, matches!(mode, InputMode::Help));
+            render::render_frame(
+                frame,
+                &sessions,
+                matches!(mode, InputMode::Help),
+                &view_mode,
+                loom_ref,
+                tree_ref,
+                label_ref,
+            );
         })?;
 
         // Poll for keyboard events with a short timeout to keep output responsive
@@ -201,8 +285,36 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
                             // Any key dismisses the help overlay
                             mode = InputMode::Normal;
                         }
+                        InputMode::TreeView => {
+                            handle_tree_view_key(
+                                key,
+                                &mut mode,
+                                &mut tree_state,
+                                &mut loom_tree,
+                                container,
+                                &mut sessions,
+                                creds_json,
+                                loom_path,
+                                &terminal,
+                                verbose,
+                                &mut log,
+                            )?;
+                        }
+                        InputMode::LabelInput => {
+                            handle_label_input_key(
+                                key,
+                                &mut mode,
+                                &mut label_buffer,
+                                &mut loom_tree,
+                                container,
+                                creds_json,
+                                loom_path,
+                                verbose,
+                                &mut log,
+                            )?;
+                        }
                         InputMode::Prefix => {
-                            match decode_prefix_key(key) {
+                            match decode_prefix_key(key, loom_active) {
                                 PrefixAction::CreateSession => {
                                     let size =
                                         terminal.size().context("Failed to get terminal size")?;
@@ -241,6 +353,16 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
                                             .send_input(sessions.active, &[0x02])
                                             .await;
                                     }
+                                }
+                                PrefixAction::TakeSnapshot => {
+                                    label_buffer.clear();
+                                    mode = InputMode::LabelInput;
+                                    continue;
+                                }
+                                PrefixAction::ShowTree => {
+                                    tree_state.refresh(&loom_tree);
+                                    mode = InputMode::TreeView;
+                                    continue;
                                 }
                                 PrefixAction::Ignore => {}
                             }
@@ -288,11 +410,172 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
     Ok(detached)
 }
 
+/// Write a log message to the optional log file.
+fn write_log(log: &mut Option<std::fs::File>, msg: &str) {
+    if let Some(f) = log.as_mut() {
+        let _ = writeln!(f, "{msg}");
+        let _ = f.flush();
+    }
+}
+
+/// Handle keyboard input in tree view mode.
+#[allow(clippy::too_many_arguments)]
+fn handle_tree_view_key(
+    key: KeyEvent,
+    mode: &mut InputMode,
+    tree_state: &mut TreeViewState,
+    loom_tree: &mut LoomTree,
+    container: &ContainerManager,
+    sessions: &mut SessionManager,
+    creds_json: Option<&str>,
+    loom_path: Option<&Path>,
+    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
+    _verbose: bool,
+    log: &mut Option<std::fs::File>,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            *mode = InputMode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            tree_state.down();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            tree_state.up();
+        }
+        KeyCode::Char('d') => {
+            // Delete selected checkpoint
+            if let Some(node_id) = tree_state.selected_node_id() {
+                if let Some(node) = loom_tree.nodes.get(&node_id) {
+                    let checkpoint_name = node.checkpoint_name.clone();
+                    // Remove Docker checkpoint
+                    if let Err(e) = container.remove_checkpoint(&checkpoint_name) {
+                        write_log(log, &format!("Warning: failed to remove Docker checkpoint: {e}"));
+                    }
+                }
+                // Remove from tree
+                loom_tree.remove_node(node_id);
+                if let Some(path) = loom_path {
+                    loom_tree.save(path)?;
+                }
+                tree_state.refresh(loom_tree);
+                write_log(log, &format!("Deleted checkpoint node {node_id}"));
+            }
+        }
+        KeyCode::Enter => {
+            // Restore from selected checkpoint
+            if let (Some(node_id), Some(creds)) = (tree_state.selected_node_id(), creds_json) {
+                if let Some(node) = loom_tree.nodes.get(&node_id).cloned() {
+                    write_log(log, &format!("Restoring from checkpoint: {} ({})", node.label, node.checkpoint_name));
+
+                    // Kill all current sessions
+                    for i in (0..sessions.sessions.len()).rev() {
+                        let _ = sessions.kill(i);
+                    }
+                    sessions.cleanup_exited();
+
+                    // Restore the container from checkpoint
+                    container.restore_checkpoint(&node.checkpoint_name, creds)?;
+
+                    // Update tree state
+                    loom_tree.current_node_id = Some(node_id);
+                    if let Some(path) = loom_path {
+                        loom_tree.save(path)?;
+                    }
+
+                    // Create a fresh session
+                    let size = terminal.size().context("Failed to get terminal size")?;
+                    sessions.create(size.width, size.height.saturating_sub(1))?;
+                    sessions.active = 0;
+
+                    write_log(log, &format!("Restored to checkpoint {node_id}, new session created"));
+                    *mode = InputMode::Normal;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Handle keyboard input in label input mode.
+#[allow(clippy::too_many_arguments)]
+fn handle_label_input_key(
+    key: KeyEvent,
+    mode: &mut InputMode,
+    label_buffer: &mut String,
+    loom_tree: &mut LoomTree,
+    container: &ContainerManager,
+    creds_json: Option<&str>,
+    loom_path: Option<&Path>,
+    _verbose: bool,
+    log: &mut Option<std::fs::File>,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            label_buffer.clear();
+            *mode = InputMode::Normal;
+        }
+        KeyCode::Enter => {
+            if !label_buffer.is_empty() {
+                if let Some(creds) = creds_json {
+                    let label = label_buffer.clone();
+                    let parent_id = loom_tree.current_node_id;
+                    let node_id = loom_tree.add_node(
+                        parent_id,
+                        &label,
+                        &container.container_id,
+                    );
+
+                    let checkpoint_name = loom_tree
+                        .nodes
+                        .get(&node_id)
+                        .map(|n| n.checkpoint_name.clone())
+                        .unwrap_or_default();
+
+                    write_log(log, &format!("Taking checkpoint: {label} ({checkpoint_name})"));
+
+                    // Create the Docker checkpoint
+                    match container.checkpoint(&checkpoint_name, creds) {
+                        Ok(()) => {
+                            write_log(log, &format!("Checkpoint {node_id} created successfully"));
+                            if let Some(path) = loom_path {
+                                loom_tree.save(path)?;
+                            }
+                        }
+                        Err(e) => {
+                            write_log(log, &format!("Checkpoint failed: {e}"));
+                            // Remove the node we just added since checkpoint failed
+                            loom_tree.remove_node(node_id);
+                            eprintln!("[loom] Checkpoint failed: {e}");
+                        }
+                    }
+                }
+            }
+            label_buffer.clear();
+            *mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            label_buffer.pop();
+        }
+        KeyCode::Char(c) => {
+            if label_buffer.len() < 50 {
+                label_buffer.push(c);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 /// Decode a key event in prefix mode into a multiplexer action.
 ///
 /// Called after the user has pressed Ctrl-b (the prefix key). Maps the
-/// follow-up keystroke to a [`PrefixAction`].
-fn decode_prefix_key(key: KeyEvent) -> PrefixAction {
+/// follow-up keystroke to a [`PrefixAction`]. When `loom_active` is true,
+/// additional keybindings for snapshot (`s`) and tree view (`t`) are available.
+fn decode_prefix_key(key: KeyEvent, loom_active: bool) -> PrefixAction {
     match key.code {
         KeyCode::Char('c') => PrefixAction::CreateSession,
         KeyCode::Char('n') => PrefixAction::NextSession,
@@ -300,6 +583,8 @@ fn decode_prefix_key(key: KeyEvent) -> PrefixAction {
         KeyCode::Char('x') => PrefixAction::KillSession,
         KeyCode::Char('d') => PrefixAction::Detach,
         KeyCode::Char('?') => PrefixAction::ShowHelp,
+        KeyCode::Char('s') if loom_active => PrefixAction::TakeSnapshot,
+        KeyCode::Char('t') if loom_active => PrefixAction::ShowTree,
         KeyCode::Char(c) if c.is_ascii_digit() => {
             let idx = c as usize - '0' as usize;
             PrefixAction::JumpToSession(idx)

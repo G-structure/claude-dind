@@ -11,6 +11,7 @@
 - [Architecture Overview](#architecture-overview)
   - [Prompt Mode](#prompt-mode-architecture)
   - [Interactive Mode](#interactive-mode-architecture)
+  - [Loom Mode (Checkpoint/Restore)](#loom-mode-checkpointrestore)
 - [Module Structure](#module-structure)
 - [Design Decisions](#design-decisions)
   - [Why Rust?](#why-rust)
@@ -21,10 +22,13 @@
   - [Why --dangerously-skip-permissions?](#why---dangerously-skip-permissions)
   - [Why shadow-terminal?](#why-shadow-terminal)
   - [Why a Long-Lived Container for Interactive Mode?](#why-a-long-lived-container-for-interactive-mode)
+  - [Why CRIU for Checkpoint/Restore?](#why-criu-for-checkpointrestore)
 - [Component Deep Dive](#component-deep-dive)
   - [Credential Extraction (`src/credentials.rs`)](#credential-extraction-srccredentialsrs)
   - [Container Management (`src/container.rs`)](#container-management-srccontainerrs)
   - [Session Management (`src/session.rs`)](#session-management-srcsessionrs)
+  - [Checkpoint Tree (`src/loom.rs`)](#checkpoint-tree-srcloomrs)
+  - [Tree Visualization (`src/loom_render.rs`)](#tree-visualization-srcloom_renderrs)
   - [Terminal Rendering (`src/render.rs`)](#terminal-rendering-srcrenderrs)
   - [Multiplexer Event Loop (`src/multiplexer.rs`)](#multiplexer-event-loop-srcmultiplexerrs)
   - [CLI Entry Point (`src/main.rs`)](#cli-entry-point-srcmainrs)
@@ -33,12 +37,15 @@
 - [Data Flow](#data-flow)
   - [Prompt Mode: End to End](#prompt-mode-end-to-end)
   - [Interactive Mode: End to End](#interactive-mode-end-to-end)
+  - [Loom Checkpoint Flow](#loom-checkpoint-flow)
+  - [Loom Restore Flow](#loom-restore-flow)
 - [Security Model](#security-model)
 - [Usage](#usage)
   - [Prerequisites](#prerequisites)
   - [Building](#building)
   - [Prompt Mode](#prompt-mode-usage)
   - [Interactive Mode](#interactive-mode-usage)
+  - [Loom Mode (Checkpoint/Restore)](#loom-mode-usage)
   - [Keybindings](#keybindings)
   - [Exit Codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -69,6 +76,10 @@ This matters for several use cases:
 4. **Interactive multiplexing** -- Manage multiple concurrent Claude Code sessions in a
    single container through a tmux-style terminal multiplexer, enabling parallel
    workflows with session switching.
+5. **Memory forking (loom)** -- Snapshot a running container's process state via CRIU
+   checkpoints, navigate a tree of snapshots, and restore to any prior state. Like
+   `git checkout` for agent memory — full process state (V8 heap, conversation context,
+   open file descriptors) preserved at each node.
 
 The challenge is that Claude Code's authentication system was not designed for this. The
 tokens live in the macOS Keychain, and there is no documented mechanism to transplant
@@ -336,6 +347,37 @@ claude-dind operates in two modes: **prompt** (ephemeral, one-shot) and **intera
    └────────────────────────────────────────────────────┘
 ```
 
+### Loom Mode (Checkpoint/Restore)
+
+Loom mode (`--loom`) extends interactive mode with CRIU-based checkpoint/restore. The
+container starts with relaxed security flags required by CRIU, and the multiplexer gains
+additional keybindings for snapshot management.
+
+```
+                Checkpoint Tree (loom.json)
+                ──────────────────────────
+                * [1] initial                      2m ago
+                ├─* [2] after-setup                1m ago
+                │ └─* [4] experiment-B             30s ago
+                └─* [3] experiment-A ●            45s ago  ← current
+
+  Ctrl-b s  →  Take checkpoint  →  docker checkpoint create --leave-running
+  Ctrl-b t  →  Show tree view   →  Navigate + Enter to restore
+                                    docker stop → docker start --checkpoint
+```
+
+Key differences from standard interactive mode:
+
+- **Container flags**: `--net=host`, `seccomp=unconfined`, `apparmor=unconfined` (CRIU
+  requires syscalls and memory inspection blocked by default Docker security profiles)
+- **Credential protocol**: Credentials are stripped before each checkpoint (so they are
+  not captured in the CRIU image) and re-injected after checkpoint/restore
+- **Containerd workaround**: Stale content blobs are purged via `ctr -n moby content rm`
+  before each checkpoint/restore operation (moby#42900)
+- **Session lifecycle**: On restore, all `docker exec` sessions are terminated (they are
+  not children of PID 1). The multiplexer creates fresh sessions that pick up Claude
+  Code's persisted conversation state from `~/.claude/` inside the container
+
 The system has three components:
 
 1. **Rust CLI** (`claude-dind`) -- Runs on the macOS host. Extracts credentials from
@@ -359,10 +401,12 @@ The system has three components:
 src/
 ├── main.rs            CLI entry point (clap subcommands: prompt, interactive)
 ├── credentials.rs     macOS Keychain extraction via `security` CLI
-├── container.rs       ContainerManager: start/stop/attach long-lived containers (DooD)
+├── container.rs       ContainerManager: start/stop/attach/checkpoint/restore (DooD)
 ├── session.rs         SessionManager: shadow-terminal ActiveTerminal + docker exec
 ├── multiplexer.rs     TUI event loop, Ctrl-b prefix keybindings, input dispatch
-└── render.rs          ratatui rendering: TerminalWidget, status bar, help overlay
+├── render.rs          ratatui rendering: TerminalWidget, status bar, help overlay
+├── loom.rs            Checkpoint tree data model + JSON persistence
+└── loom_render.rs     Tree visualization ratatui widget (git-log-style)
 
 docker/
 ├── Dockerfile         docker:cli + Node.js + Claude Code + non-root user
@@ -550,6 +594,39 @@ a single container that stays alive:
 4. **Shared filesystem.** Multiple Claude sessions can read/write the same `/workspace`,
    enabling collaborative workflows.
 
+### Why CRIU for Checkpoint/Restore?
+
+The loom feature needs to capture and restore the **full process state** of a running
+Claude Code session — not just files, but the V8 heap, conversation context held in
+memory, open file descriptors, and TCP connections. We evaluated three approaches:
+
+**Option A: Application-level serialization.** Have Claude Code export its internal state
+to disk, then reload it.
+- Problem: Claude Code is a third-party binary. We have no control over its internal
+  state management. Its conversation context, model state, and runtime are opaque.
+
+**Option B: Filesystem-only snapshots.** Copy `~/.claude/` between checkpoints.
+- Problem: This captures persisted state but misses in-memory state. A restored session
+  would start cold — no in-flight conversation, no loaded model context.
+
+**Option C: CRIU process checkpoint (chosen).** Use Linux's CRIU (Checkpoint/Restore In
+Userspace) via Docker's checkpoint API to snapshot the entire container's process tree.
+- Captures everything: memory pages, file descriptors, network sockets, signal state.
+- Restore recreates the exact process state. Claude Code's V8 heap and conversation
+  context are preserved byte-for-byte.
+- Integrated with Docker: `docker checkpoint create` / `docker start --checkpoint`.
+- Trade-off: Requires Linux host with Docker experimental mode and CRIU 4.2+ installed.
+  Not available on macOS (CRIU not in Docker Desktop VM).
+
+The CRIU approach requires relaxed security flags because CRIU uses ptrace and other
+syscalls blocked by Docker's default seccomp profile:
+- `--security-opt seccomp=unconfined` — allows CRIU's syscalls
+- `--security-opt apparmor=unconfined` — allows CRIU's memory inspection
+- `--net=host` — containerd#12141 workaround (netns bind-mount failure during restore)
+
+These flags are only applied when `--loom` is passed. Without `--loom`, the container
+uses the standard `--security-opt no-new-privileges` flag.
+
 ---
 
 ## Component Deep Dive
@@ -566,9 +643,12 @@ JSON string.
 
 `ContainerManager` wraps a long-lived container with the host Docker socket mounted. Key methods:
 
-- **`start(image, verbose, workspace, docker_socket)`** -- `docker run -d` with socket
-  mount, `--security-opt no-new-privileges`, and `CLAUDE_MODE=interactive`. Returns the
-  container ID. Optionally mounts a host workspace directory.
+**Lifecycle:**
+- **`start(image, verbose, workspace, docker_socket, loom)`** -- `docker run -d` with
+  socket mount and `CLAUDE_MODE=interactive`. Security flags depend on the `loom`
+  parameter: when `false`, uses `--security-opt no-new-privileges`; when `true`, uses
+  `--net=host`, `seccomp=unconfined`, and `apparmor=unconfined` (required by CRIU).
+  Returns the container ID. Optionally mounts a host workspace directory.
 - **`attach(container_id)`** -- Connects to an already-running container. Verifies it is
   still running via `docker inspect`.
 - **`inject_credentials(creds_json)`** -- Writes the credential JSON into the container
@@ -579,6 +659,23 @@ JSON string.
 - **`stop()`** -- `docker rm -f <id>`.
 - **`is_running()`** -- `docker inspect --format {{.State.Running}}`.
 - **`short_id()`** -- First 12 characters of the container ID for display.
+
+**Checkpoint operations (loom):**
+- **`checkpoint(checkpoint_name, creds_json)`** -- Takes a CRIU checkpoint of the running
+  container. Protocol: (1) strip credentials from container filesystem, (2) purge stale
+  containerd blobs, (3) `docker checkpoint create --leave-running`, (4) re-inject fresh
+  credentials. The `--leave-running` flag keeps the container alive after snapshotting.
+- **`restore_checkpoint(checkpoint_name, creds_json)`** -- Restores the container from a
+  named checkpoint. Protocol: (1) `docker stop` (kills all exec sessions), (2) purge
+  stale containerd blobs, (3) `docker start --checkpoint <name>`, (4) wait for
+  readiness, (5) inject fresh credentials.
+- **`ensure_experimental()`** (static) -- Checks `docker info --format '{{.ExperimentalBuild}}'`.
+  Returns a clear error if Docker experimental mode is not enabled.
+- **`list_checkpoints()`** -- `docker checkpoint ls <id> --format '{{.Name}}'`.
+- **`remove_checkpoint(checkpoint_name)`** -- `docker checkpoint rm <id> <name>`.
+- **`purge_containerd_blobs()`** (private static) -- Runs `sudo ctr -n moby content ls -q`
+  and removes each blob. Workaround for moby#42900 where stale content blobs cause
+  checkpoint create/restore to fail with "content already exists" errors.
 
 ### Session Management (`src/session.rs`)
 
@@ -606,14 +703,101 @@ variants:
 - `Output::Diff(SurfaceDiff)` -- Incremental changes applied to the existing `Surface`.
 
 Other methods: `kill()`, `cleanup_exited()`, `resize_all()`, `next()`, `prev()`,
-`switch_to()`, `count()`.
+`switch_to()`, `count()`, `set_container_id()`, `container_id()`.
+
+The `set_container_id()` method exists for loom checkpoint restore: when the container is
+restored from a checkpoint, the container ID remains the same but all `docker exec`
+sessions are terminated. The multiplexer kills its sessions, the container is restored,
+and fresh sessions are created using the same container ID.
+
+### Checkpoint Tree (`src/loom.rs`)
+
+Pure data model for the checkpoint tree. No Docker operations, no TUI rendering. Unit-
+testable in isolation.
+
+**`SnapshotNode`** -- Metadata for a single checkpoint:
+- `id: u64` -- Monotonic counter (unique within the tree)
+- `parent_id: Option<u64>` -- `None` for root nodes
+- `label: String` -- User-provided name (e.g., "initial", "after-setup")
+- `timestamp: u64` -- Unix seconds when the checkpoint was taken
+- `checkpoint_name: String` -- Docker checkpoint name (e.g., `loom-3-after-setup`)
+- `source_container_id: String` -- Container that was checkpointed
+- `description: Option<String>` -- Optional longer description
+
+**`LoomTree`** -- The full checkpoint tree:
+- `schema_version: String` -- Always `"loom-v1"` for forward compatibility
+- `next_id: u64` -- Monotonic counter for generating node IDs
+- `nodes: HashMap<u64, SnapshotNode>` -- All nodes indexed by ID
+- `current_node_id: Option<u64>` -- Which checkpoint the container is currently "on"
+
+Key methods:
+- `load_or_create(path)` -- Loads from JSON file or creates a new empty tree
+- `save(path)` -- Persists to JSON with pretty-printing
+- `add_node(parent_id, label, checkpoint_name, container_id)` -- Adds a new node,
+  increments `next_id`, returns the new node's ID
+- `get_children(id)` -- Returns child node IDs sorted by timestamp
+- `roots()` -- Returns root node IDs (no parent) sorted by timestamp
+- `remove_node(id)` -- Removes a node and all its descendants recursively. Also removes
+  any `current_node_id` reference if the removed node was current.
+- `build_flat_list()` -- DFS traversal producing a `Vec<FlatNode>` for rendering
+
+**`FlatNode`** -- Flattened representation for the tree widget:
+- `node_id`, `depth`, `label`, `timestamp`, `is_current`, `is_last_sibling`
+- Computed by `dfs_flatten()` which tracks sibling position for tree prefix rendering
+
+Helper functions:
+- `sanitize_label(label)` -- Normalizes user input to filesystem-safe names (lowercase,
+  non-alphanumeric chars replaced with hyphens, truncated to 40 chars)
+- `relative_time(timestamp)` -- Formats timestamps as human-readable relative strings
+  ("30s ago", "2m ago", "1h ago", "3d ago")
+
+Persisted as JSON at `~/.claude-dind/loom.json` (configurable via `--loom-file`).
+
+### Tree Visualization (`src/loom_render.rs`)
+
+Git-log-style tree widget for navigating checkpoints, built on ratatui.
+
+**`TreeViewState`** -- Navigation state for the tree view:
+- `flat_nodes: Vec<FlatNode>` -- Flattened tree from `LoomTree::build_flat_list()`
+- `selected: usize` -- Currently highlighted index
+- `scroll: usize` -- Scroll offset for tall trees
+- Methods: `refresh(tree)`, `up()`, `down()`, `selected_node_id()`
+
+**`render_tree_view(frame, area, tree, state)`** -- Renders the full tree panel:
+```
+  Snapshot Tree (4 checkpoints)
+  ─────────────────────────────
+  * [1] initial                      2m ago
+  ├─* [2] after-setup                1m ago
+  │ └─* [4] experiment-B             30s ago
+  └─* [3] experiment-A ●            45s ago
+
+  j/k navigate  Enter restore  d delete  q back
+```
+- Header with checkpoint count
+- Tree body with Unicode box-drawing prefixes (`├─`, `└─`, `│ `)
+- Current node marked with `●`, selected node in reverse colors
+- Relative timestamps right-aligned
+- Footer with keybind hints
+
+**`render_label_input(frame, area, label_buffer)`** -- Bottom overlay for naming a new
+checkpoint. Rendered on top of the terminal view when the user presses `Ctrl-b s`.
+
+Tree prefix computation tracks continuation lines per depth level using a `Vec<bool>` to
+determine whether to draw `│ ` (continuing) or `  ` (last sibling) at each depth.
 
 ### Terminal Rendering (`src/render.rs`)
 
+**View mode dispatch**: `render_frame()` dispatches based on `ViewMode`:
+- **`Terminal`** -- Default: renders the active session's terminal output.
+- **`TreeView`** -- Loom tree view (delegates to `loom_render::render_tree_view()`).
+- **`LabelInput`** -- Terminal view with a label input overlay at the bottom.
+
 `render_frame()` splits the terminal into two areas:
 1. **Terminal area** (fills available space) -- Renders the active session's termwiz
-   `Surface` via a custom `TerminalWidget`.
-2. **Status bar** (1 line) -- Shows session tabs with active indicator and help hint.
+   `Surface` via a custom `TerminalWidget`, or the tree view when in `TreeView` mode.
+2. **Status bar** (1 line) -- Shows session tabs, an optional checkpoint indicator
+   (`● snap:N` when loom checkpoints exist), and a help hint.
 
 **`TerminalWidget`**: Implements `ratatui::Widget`. Iterates through `surface.screen_lines()`
 and `line.cells()`, mapping each termwiz cell to a ratatui buffer cell. Converts:
@@ -621,15 +805,18 @@ and `line.cells()`, mapping each termwiz cell to a ratatui buffer cell. Converts
 - `CellAttributes` (intensity, italic, underline, strikethrough, reverse) to `ratatui::Modifier`
 - Cell text via `cell.str()`
 
-**Status bar**: `[0:claude-1*] [1:claude-2]  Ctrl-b ? for help` -- Active session
-highlighted in green, exited sessions dimmed, help hint right-aligned in yellow.
+**Status bar**: `[0:claude-1*] [1:claude-2] ● snap:3  Ctrl-b ? for help` -- Active
+session highlighted in green, exited sessions dimmed, checkpoint indicator in magenta
+(when loom checkpoints exist), help hint right-aligned in yellow.
 
 **Help overlay**: Centered bordered panel listing all keybindings, rendered above the
-terminal content.
+terminal content. When loom mode is active, the overlay includes an additional section
+with loom-specific keybindings (`s` for snapshot, `t` for tree view).
 
 ### Multiplexer Event Loop (`src/multiplexer.rs`)
 
-`run(container, detach_on_exit) -> Result<bool>` -- Main async event loop.
+`run(container, detach_on_exit, creds_json, loom_path, verbose) -> Result<bool>` -- Main
+async event loop.
 
 **State machine** for input handling:
 - **Normal mode**: All keys forwarded to the active session, except `Ctrl-b` which
@@ -641,8 +828,15 @@ terminal content.
   - `x` -- Kill current session
   - `d` -- Detach (returns `true` to keep container running)
   - `?` -- Show help overlay
+  - `s` -- Take snapshot (loom only; enters LabelInput mode)
+  - `t` -- Show tree view (loom only; enters TreeView mode)
   - `Ctrl-b` -- Send literal `Ctrl-b` (0x02) to session
 - **Help mode**: Any key dismisses the overlay.
+- **TreeView mode** (loom): `j`/`k` or arrows navigate the tree, `Enter` restores
+  from the selected checkpoint, `d` deletes a checkpoint, `q`/`Esc` returns to
+  terminal view.
+- **LabelInput mode** (loom): User types a label for the new checkpoint. `Enter`
+  confirms (takes the checkpoint), `Esc` cancels.
 
 **Key-to-bytes conversion** (`key_event_to_bytes`): Translates crossterm `KeyEvent` into
 PTY-compatible byte sequences. Handles Ctrl+key combinations (0x01-0x1a), UTF-8
@@ -657,6 +851,13 @@ responsiveness with CPU usage.
 
 **Logging**: Writes debug output to `/tmp/claude-dind-mux.log` with timestamps. Logs
 session creation, output events (first 50 frames), task completion, and input errors.
+
+**Loom orchestration** (when `--loom` is active): The multiplexer manages additional
+state: `loom_tree: LoomTree`, `tree_state: TreeViewState`, `label_buffer: String`, and
+`creds_json: String`. Snapshot flow: Ctrl-b s → type label → Enter → checkpoint created,
+node added to tree. Restore flow: Ctrl-b t → navigate → Enter → kill all sessions →
+restore checkpoint → create fresh session. The `creds_json` is passed to checkpoint/
+restore operations for credential stripping and re-injection.
 
 ### CLI Entry Point (`src/main.rs`)
 
@@ -673,7 +874,14 @@ Two clap subcommands:
   runtime and runs the multiplexer TUI. On detach, prints the container ID for
   reattachment. On normal exit (all sessions ended), stops the container. Options:
   `--build`, `--image`, `--docker-context`, `-w`/`--workspace`, `--docker-socket`,
-  `--attach <id>`, `-v`.
+  `--attach <id>`, `-v`, `--loom`, `--loom-file`.
+
+When `--loom` is passed:
+- Calls `ContainerManager::ensure_experimental()` to verify Docker experimental mode
+- Passes `loom: true` to `ContainerManager::start()` for checkpoint-compatible flags
+- Resolves `--loom-file` path (defaults to `~/.claude-dind/loom.json`, supports `~`
+  expansion) and creates the parent directory
+- Passes `creds_json` and `loom_path` to `multiplexer::run()` for checkpoint operations
 
 Helper functions: `resolve_docker_context()` (finds the `docker/` directory),
 `build_image()` (runs `docker build`), `run_container()` (prompt mode Docker lifecycle).
@@ -799,6 +1007,66 @@ Step 11: On reattach: Rust CLI connects to existing container, re-enters TUI
 Step 12: When all sessions end: container is stopped and removed
 ```
 
+### Loom Checkpoint Flow
+
+```
+Step 1:  User presses Ctrl-b s in the multiplexer
+
+Step 2:  Multiplexer enters LabelInput mode, renders input overlay
+
+Step 3:  User types a label (e.g., "after-setup") and presses Enter
+
+Step 4:  Multiplexer calls container.checkpoint("loom-2-after-setup", &creds_json)
+         4a. docker exec <id> rm -f /home/claude/.claude/.credentials.json
+             (credentials stripped before snapshot)
+         4b. sudo ctr -n moby content ls -q | ... content rm
+             (purge stale containerd blobs — moby#42900 workaround)
+         4c. docker checkpoint create --leave-running <id> loom-2-after-setup
+             (CRIU snapshots entire process tree; container keeps running)
+         4d. container.inject_credentials(&creds_json)
+             (fresh credentials re-injected)
+
+Step 5:  Multiplexer adds node to LoomTree
+         (parent = current_node_id, label = "after-setup")
+
+Step 6:  current_node_id updated to new node ID
+
+Step 7:  LoomTree saved to ~/.claude-dind/loom.json
+
+Step 8:  Multiplexer returns to Normal mode
+```
+
+### Loom Restore Flow
+
+```
+Step 1:  User presses Ctrl-b t, navigates tree, presses Enter on target node
+
+Step 2:  Multiplexer kills all active sessions
+         (sessions.kill() for each, then cleanup_exited())
+
+Step 3:  Multiplexer calls container.restore_checkpoint("loom-1-initial", &creds_json)
+         3a. docker stop <id>
+             (container stops, all docker exec processes terminated)
+         3b. sudo ctr -n moby content ls -q | ... content rm
+             (purge stale containerd blobs)
+         3c. docker start --checkpoint loom-1-initial <id>
+             (CRIU restores process tree from checkpoint image)
+         3d. container.wait_for_ready(10)
+             (poll docker exec <id> docker info until socket accessible)
+         3e. container.inject_credentials(&creds_json)
+             (fresh credentials injected into restored container)
+
+Step 4:  current_node_id updated to target node
+
+Step 5:  LoomTree saved to ~/.claude-dind/loom.json
+
+Step 6:  Multiplexer creates a fresh session
+         (new docker exec process; Claude Code starts and picks up
+          persisted conversation state from ~/.claude/ in the container)
+
+Step 7:  Multiplexer returns to Normal mode with terminal view
+```
+
 ---
 
 ## Security Model
@@ -826,8 +1094,10 @@ file descriptors without hitting disk.
 **Threat: Docker socket access (host daemon exposure).**
 Accepted risk: Mounting the host Docker socket gives the container access to the host
 Docker daemon. Claude can create/inspect/remove sibling containers. This is mitigated by:
-`--security-opt no-new-privileges` (prevents privilege escalation), running Claude as a
-non-root user, and removing the `--privileged` flag entirely (no extra kernel capabilities).
+`--security-opt no-new-privileges` in standard mode (prevents privilege escalation),
+running Claude as a non-root user, and removing the `--privileged` flag entirely (no
+extra kernel capabilities). In loom mode, the `no-new-privileges` flag is replaced with
+CRIU-compatible flags (see "Relaxed security flags in loom mode" below).
 
 **Threat: Concurrent token use triggers rate limiting or revocation.**
 Observation: OAuth tokens are bearer tokens with no device binding. Using the same tokens
@@ -839,6 +1109,24 @@ container, which is indistinguishable from a single session from the server's pe
 Mitigation: Credentials persist in the container's filesystem for its entire lifetime
 (unlike prompt mode where they are deleted after use). This is a conscious tradeoff for
 usability. When the container is stopped (`docker rm -f`), all data is destroyed.
+
+**Threat: Credentials captured in CRIU checkpoint images (loom mode).**
+Mitigation: The checkpoint protocol explicitly strips credentials from the container
+filesystem (`rm -f .credentials.json`) before calling `docker checkpoint create`. This
+ensures the CRIU image (which captures filesystem state) does not contain the credential
+JSON. Fresh credentials are re-injected after every checkpoint and restore operation.
+
+**Threat: Relaxed security flags in loom mode.**
+Accepted risk: Loom mode requires `seccomp=unconfined`, `apparmor=unconfined`, and
+`--net=host` for CRIU to function. This is a weaker security posture than standard
+interactive mode. These flags are only applied when the user explicitly passes `--loom`.
+Without `--loom`, the container uses `--security-opt no-new-privileges`. The security
+implications are documented in the CLI help text and this document.
+
+**Threat: Stale containerd blobs cause checkpoint failures.**
+Mitigation: The `purge_containerd_blobs()` method runs `sudo ctr -n moby content rm`
+before every checkpoint create and restore operation. This works around Docker/containerd
+issue moby#42900 where leftover content blobs prevent checkpoint operations.
 
 ---
 
@@ -926,6 +1214,55 @@ claude-dind interactive -v
 **Note:** Interactive mode must be run from a real terminal (Terminal.app, iTerm2, etc.),
 not from within another TUI or a non-TTY environment.
 
+### Loom Mode Usage
+
+Loom mode extends interactive mode with CRIU-based checkpoint/restore. Requires a Linux
+host with Docker experimental mode and CRIU installed.
+
+**Prerequisites (Linux only):**
+```bash
+# Enable Docker experimental mode
+echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+
+# Install CRIU 4.2+
+sudo add-apt-repository -y ppa:criu/ppa
+sudo apt install -y criu
+
+# Verify
+docker info | grep Experimental    # should show: Experimental: true
+criu --version                      # should show 4.2+
+```
+
+**Starting loom mode:**
+```bash
+# Start with loom enabled (builds image first if needed)
+claude-dind interactive --build --loom
+
+# With a workspace mount
+claude-dind interactive --build --loom -w ./my-project
+
+# Custom loom file location
+claude-dind interactive --loom --loom-file /path/to/loom.json
+```
+
+**Taking a checkpoint:**
+1. Press `Ctrl-b s` — a label input overlay appears at the bottom
+2. Type a name (e.g., "initial", "after-setup")
+3. Press `Enter` — the checkpoint is created, container continues running
+4. Press `Esc` to cancel without taking a checkpoint
+
+**Viewing and restoring checkpoints:**
+1. Press `Ctrl-b t` — the tree view shows all checkpoints
+2. Navigate with `j`/`k` or arrow keys
+3. Press `Enter` on a checkpoint to restore to that state
+4. Press `d` on a checkpoint to delete it
+5. Press `q` or `Esc` to return to the terminal view
+
+**Note:** Loom mode is not available on macOS. CRIU is a Linux-only technology and is not
+available inside the Docker Desktop VM. Standard interactive mode (without `--loom`)
+works on both macOS and Linux.
+
 ### Keybindings
 
 All keybindings use a **Ctrl-b prefix** (like tmux). Press `Ctrl-b`, release, then
@@ -941,6 +1278,18 @@ press the command key.
 | `Ctrl-b d` | Detach (exit TUI, container keeps running) |
 | `Ctrl-b ?` | Toggle help overlay |
 | `Ctrl-b Ctrl-b` | Send a literal Ctrl-b to the active session |
+| `Ctrl-b s` | Take snapshot / checkpoint (loom mode only) |
+| `Ctrl-b t` | Show snapshot tree view (loom mode only) |
+
+**Tree view keybindings** (when in tree view via `Ctrl-b t`):
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move selection down |
+| `k` / `↑` | Move selection up |
+| `Enter` | Restore from selected checkpoint |
+| `d` | Delete selected checkpoint |
+| `q` / `Esc` | Return to terminal view |
 
 All other input is forwarded directly to the active session.
 
@@ -1004,6 +1353,37 @@ All other input is forwarded directly to the active session.
   to start. Check if `docker exec -it <id> claude --dangerously-skip-permissions`
   works manually.
 
+**"Docker experimental mode is not enabled" (loom mode)**
+- CRIU checkpoints require Docker experimental mode. Enable it:
+  ```bash
+  echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+  sudo systemctl restart docker
+  ```
+- Verify: `docker info | grep Experimental` should show `true`.
+
+**"docker checkpoint create failed" (loom mode)**
+- Ensure CRIU 4.2+ is installed: `criu --version`. Install via `ppa:criu/ppa` on Ubuntu.
+- The containerd blob purge may have failed. Check if `sudo ctr -n moby content ls -q`
+  returns any entries. If so, manually remove them:
+  `sudo ctr -n moby content ls -q | xargs -r sudo ctr -n moby content rm`
+- Check Docker logs for CRIU errors: `sudo journalctl -u docker --since "5 min ago"`
+
+**"docker start --checkpoint failed" (loom mode)**
+- Same blob purge issue as above. Also verify the checkpoint exists:
+  `docker checkpoint ls <container-id>`
+- The checkpoint may be from a different container image version. Checkpoints are not
+  portable across image rebuilds.
+
+**Checkpoint takes a long time or hangs**
+- CRIU must freeze all processes and dump their memory pages. Large working sets take
+  longer. Check system memory and disk I/O.
+- Ensure the container is not performing heavy I/O during the checkpoint.
+
+**Restored session doesn't have my latest conversation**
+- Checkpoints capture the container state at the moment they were taken. Any work done
+  after the checkpoint was taken is not included. This is by design — checkpoints are
+  save points, not snapshots of the future.
+
 ---
 
 ## Limitations and Future Work
@@ -1014,8 +1394,10 @@ All other input is forwarded directly to the active session.
 
 2. **Docker socket security.** The host Docker socket is mounted into the container,
    giving Claude access to the host Docker daemon. Containers created by Claude run as
-   sibling containers on the host, not nested. This is mitigated by `--security-opt
-   no-new-privileges` and running as non-root, but is a weaker isolation boundary than
+   sibling containers on the host, not nested. In standard mode, this is mitigated by
+   `--security-opt no-new-privileges` and running as non-root. In loom mode, security
+   flags are relaxed further (`seccomp=unconfined`, `apparmor=unconfined`, `--net=host`)
+   for CRIU compatibility — a weaker isolation boundary than either standard mode or
    true DinD.
 
 3. **No token refresh persistence.** If Claude Code refreshes the access token inside the
@@ -1042,3 +1424,20 @@ All other input is forwarded directly to the active session.
 
 7. **Single-host only.** Both modes require Docker to be running on the same machine.
    Remote Docker host support (via `DOCKER_HOST`) is not tested.
+
+8. **Loom mode is Linux-only.** CRIU is a Linux-only technology. Docker Desktop on macOS
+   runs containers inside a Linux VM, but CRIU is not installed in that VM and Docker
+   Desktop does not expose the checkpoint API. Loom mode requires a native Linux Docker
+   host with CRIU 4.2+ and Docker experimental mode enabled.
+
+9. **Checkpoints are not portable.** CRIU checkpoints are tied to the specific container
+   ID, image, and kernel version. They cannot be moved between hosts, transferred
+   across Docker image rebuilds, or shared between containers. The checkpoint tree
+   (`loom.json`) persists on the host, but the actual checkpoint images live in Docker's
+   internal storage.
+
+10. **Restore kills all sessions.** When restoring from a checkpoint, all active `docker
+    exec` sessions are terminated because they are not children of the container's PID 1.
+    The multiplexer creates a fresh session after restore. Claude Code picks up its
+    persisted conversation state from `~/.claude/` inside the restored container, but
+    any in-flight interactive state (partially typed input, etc.) is lost.

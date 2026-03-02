@@ -13,21 +13,34 @@
 //! `Surface` and writing each cell into the ratatui `Buffer`, converting
 //! colors and attributes along the way.
 //!
+//! ## View Modes
+//!
+//! The renderer dispatches based on [`ViewMode`]:
+//!
+//! - **`Terminal`** — Default view showing the active session's terminal output.
+//! - **`TreeView`** — Loom checkpoint tree (delegates to [`crate::loom_render`]).
+//! - **`LabelInput`** — Terminal view with a label input overlay at the bottom
+//!   for naming new checkpoints.
+//!
 //! ## Layout
 //!
 //! ```text
 //! ┌──────────────────────────────────────┐
-//! │                                      │  ← Terminal area (TerminalWidget)
-//! │  Active session's terminal output    │     Fills all available space
-//! │  (rendered from termwiz Surface)     │
+//! │                                      │  ← Main area (Terminal, TreeView,
+//! │  Content depends on ViewMode         │     or Terminal + LabelInput overlay)
 //! │                                      │
 //! │                                      │
 //! ├──────────────────────────────────────┤
-//! │ [0:claude-1*] [1:claude-2]  Ctrl-b ? │  ← Status bar (1 line)
+//! │ [0:claude-1*] ● snap:3  Ctrl-b ?    │  ← Status bar (1 line)
 //! └──────────────────────────────────────┘
 //! ```
 //!
-//! An optional help overlay can be displayed centered on screen.
+//! The status bar shows session tabs, an optional checkpoint indicator
+//! (`● snap:N` when loom checkpoints exist), and a help hint.
+//!
+//! An optional help overlay can be displayed centered on screen. When loom
+//! is active, the help overlay includes additional keybindings for `s`
+//! (snapshot) and `t` (tree view).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -39,26 +52,62 @@ use termwiz::cell::{CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::surface::Surface;
 
+use crate::loom::LoomTree;
+use crate::loom_render::{self, TreeViewState};
 use crate::session::SessionManager;
 
-/// Render the complete multiplexer frame: terminal area + status bar + optional help.
+/// Which view the multiplexer is currently displaying.
+pub enum ViewMode {
+    /// Normal terminal view showing the active session.
+    Terminal,
+    /// Loom tree view showing checkpoint history.
+    TreeView,
+    /// Label input overlay for naming a new checkpoint.
+    LabelInput,
+}
+
+/// Render the complete multiplexer frame, dispatching based on view mode.
 ///
 /// This is called on every frame (~60fps). The layout is:
-/// - Terminal area: fills all available space, renders the active session's screen
+/// - Terminal area: fills all available space
 /// - Status bar: fixed 1-line height at the bottom
-/// - Help overlay: centered panel, rendered on top of everything when `show_help` is true
-pub fn render_frame(frame: &mut Frame, sessions: &SessionManager, show_help: bool) {
+/// - Overlays: help, tree view, or label input depending on mode
+pub fn render_frame(
+    frame: &mut Frame,
+    sessions: &SessionManager,
+    show_help: bool,
+    view_mode: &ViewMode,
+    loom_tree: Option<&LoomTree>,
+    tree_state: Option<&TreeViewState>,
+    label_buffer: Option<&str>,
+) {
     let chunks = Layout::vertical([
         Constraint::Min(1),    // Terminal area
         Constraint::Length(1), // Status bar
     ])
     .split(frame.area());
 
-    render_terminal_area(frame, chunks[0], sessions);
-    render_status_bar(frame, chunks[1], sessions);
+    match view_mode {
+        ViewMode::Terminal => {
+            render_terminal_area(frame, chunks[0], sessions);
+        }
+        ViewMode::TreeView => {
+            if let (Some(tree), Some(state)) = (loom_tree, tree_state) {
+                loom_render::render_tree_view(frame, chunks[0], tree, state);
+            }
+        }
+        ViewMode::LabelInput => {
+            render_terminal_area(frame, chunks[0], sessions);
+            if let Some(buf) = label_buffer {
+                loom_render::render_label_input(frame, chunks[0], buf);
+            }
+        }
+    }
+
+    render_status_bar(frame, chunks[1], sessions, loom_tree);
 
     if show_help {
-        render_help_overlay(frame);
+        render_help_overlay(frame, loom_tree.is_some());
     }
 }
 
@@ -79,8 +128,13 @@ fn render_terminal_area(frame: &mut Frame, area: Rect, sessions: &SessionManager
     }
 }
 
-/// Render the status bar showing session list and key hints.
-fn render_status_bar(frame: &mut Frame, area: Rect, sessions: &SessionManager) {
+/// Render the status bar showing session list, checkpoint indicator, and key hints.
+fn render_status_bar(
+    frame: &mut Frame,
+    area: Rect,
+    sessions: &SessionManager,
+    loom_tree: Option<&LoomTree>,
+) {
     let mut spans = Vec::new();
 
     for (i, session) in sessions.sessions.iter().enumerate() {
@@ -107,6 +161,25 @@ fn render_status_bar(frame: &mut Frame, area: Rect, sessions: &SessionManager) {
         ));
     }
 
+    // Show checkpoint indicator when loom is active
+    if let Some(tree) = loom_tree {
+        if !tree.is_empty() {
+            let snap_label = if let Some(current_id) = tree.current_node_id {
+                format!(" \u{25cf} snap:{current_id} ")
+            } else {
+                format!(" \u{25cf} snap:{} ", tree.len())
+            };
+            spans.push(Span::styled(
+                snap_label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
+    }
+
     // Right-align the help hint
     let hint = " Ctrl-b ? for help ";
     let content_len: usize = spans.iter().map(|s| s.width()).sum();
@@ -125,18 +198,19 @@ fn render_status_bar(frame: &mut Frame, area: Rect, sessions: &SessionManager) {
 }
 
 /// Render the help overlay panel.
-fn render_help_overlay(frame: &mut Frame) {
+fn render_help_overlay(frame: &mut Frame, loom_active: bool) {
     let area = frame.area();
-    // Center a box roughly 50x14
+    // Center a box roughly 50x14 (taller if loom is active)
     let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 16u16.min(area.height.saturating_sub(4));
+    let base_h = if loom_active { 20u16 } else { 16u16 };
+    let h = base_h.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let overlay = Rect::new(x, y, w, h);
 
     frame.render_widget(Clear, overlay);
 
-    let help_text = vec![
+    let mut help_text = vec![
         Line::from(Span::styled(
             "Keybindings (prefix: Ctrl-b)",
             Style::default()
@@ -172,6 +246,27 @@ fn render_help_overlay(frame: &mut Frame) {
             Span::styled("  ?    ", Style::default().fg(Color::Green)),
             Span::raw("Toggle this help"),
         ]),
+    ];
+
+    if loom_active {
+        help_text.push(Line::from(""));
+        help_text.push(Line::from(Span::styled(
+            "Loom (checkpoint)",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        help_text.push(Line::from(vec![
+            Span::styled("  s    ", Style::default().fg(Color::Green)),
+            Span::raw("Take snapshot (checkpoint)"),
+        ]));
+        help_text.push(Line::from(vec![
+            Span::styled("  t    ", Style::default().fg(Color::Green)),
+            Span::raw("Show snapshot tree"),
+        ]));
+    }
+
+    help_text.extend([
         Line::from(""),
         Line::from(Span::styled(
             "All other input is forwarded to the active session.",
@@ -182,7 +277,7 @@ fn render_help_overlay(frame: &mut Frame) {
             "Press any key to close this help.",
             Style::default().fg(Color::Yellow),
         )),
-    ];
+    ]);
 
     let block = Block::default()
         .title(" Help ")

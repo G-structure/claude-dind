@@ -68,6 +68,10 @@ pub struct Session {
 /// displayed session. Navigation methods (`next`, `prev`, `switch_to`) update
 /// this index; the renderer reads it to determine which session's screen to
 /// display.
+///
+/// The `container_id` can be updated via [`set_container_id`](Self::set_container_id)
+/// after a loom checkpoint restore, since the restored container retains the
+/// same ID but all `docker exec` sessions are terminated and must be recreated.
 pub struct SessionManager {
     /// All sessions, both active and exited. Exited sessions are cleaned up
     /// by [`cleanup_exited`](Self::cleanup_exited).
@@ -76,14 +80,23 @@ pub struct SessionManager {
     pub active: usize,
     /// Docker container ID. Used to construct `docker exec` commands.
     container_id: String,
+    /// Optional remote Docker host (e.g., "tcp://localhost:12345").
+    /// When set, docker exec commands include `-H <host>`.
+    docker_host: Option<String>,
 }
 
 impl SessionManager {
+    #[allow(dead_code)]
     pub fn new(container_id: String) -> Self {
+        Self::new_with_host(container_id, None)
+    }
+
+    pub fn new_with_host(container_id: String, docker_host: Option<String>) -> Self {
         Self {
             sessions: Vec::new(),
             active: 0,
             container_id,
+            docker_host,
         }
     }
 
@@ -106,12 +119,16 @@ impl SessionManager {
         let name = format!("claude-{}", idx + 1);
 
         // Build the command that shadow-terminal will execute as a PTY process.
-        // docker exec -it <container> su -l claude -c "..."
+        // docker [-H host] exec -it <container> su -l claude -c "..."
         // Run through bash -c so that docker exec inherits a proper TTY
         // from portable-pty's PTY slave. Using bash -c ensures the shell
         // sets up the TTY correctly before calling docker exec.
+        let host_flag = match &self.docker_host {
+            Some(host) => format!("-H {host} "),
+            None => String::new(),
+        };
         let docker_cmd = format!(
-            "docker exec -it {} su -l claude -c 'export PATH=/usr/local/bin:/usr/bin:/bin:$PATH && cd /workspace && claude --dangerously-skip-permissions'",
+            "docker {host_flag}exec -it {} su -l claude -c 'export PATH=/usr/local/bin:/usr/bin:/bin:$PATH && cd /workspace && claude --dangerously-skip-permissions'",
             self.container_id
         );
 
@@ -295,5 +312,17 @@ impl SessionManager {
         if idx < self.sessions.len() {
             self.active = idx;
         }
+    }
+
+    /// Update the container ID (used after checkpoint restore swaps the container).
+    #[allow(dead_code)]
+    pub fn set_container_id(&mut self, id: String) {
+        self.container_id = id;
+    }
+
+    /// Get the current container ID.
+    #[allow(dead_code)]
+    pub fn container_id(&self) -> &str {
+        &self.container_id
     }
 }

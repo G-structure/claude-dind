@@ -8,7 +8,7 @@
 //!
 //! ### Prompt mode (`claude-dind prompt "..."`)
 //!
-//! The original mode: runs a single Claude Code prompt in an ephemeral container.
+//! Runs a single Claude Code prompt in an ephemeral container.
 //!
 //! 1. Extracts the OAuth credential JSON from macOS Keychain using the `security` CLI.
 //! 2. Validates the JSON structure (checks for `claudeAiOauth.accessToken`).
@@ -33,6 +33,25 @@
 //! 5. Detaching (`Ctrl-b d`) exits the TUI but keeps the container alive.
 //!    Re-attach with `claude-dind interactive --attach <container-id>`.
 //!
+//! ### Loom mode (`claude-dind interactive --loom`)
+//!
+//! Adds CRIU-backed checkpoint/restore to interactive mode. Snapshots the running
+//! container's process memory at any point, navigates a tree of snapshots, and
+//! restores to any prior state. Like `git checkout` for agent memory.
+//!
+//! - `Ctrl-b s` — Take a named checkpoint (non-disruptive, container keeps running)
+//! - `Ctrl-b t` — Browse the checkpoint tree, restore or delete snapshots
+//!
+//! Requires Linux with Docker experimental mode and CRIU 4.2+ installed.
+//! Not available on macOS (CRIU doesn't run in Docker Desktop's VM).
+//!
+//! When `--loom` is active, the container starts with relaxed security flags
+//! (`--net=host`, `seccomp=unconfined`, `apparmor=unconfined`) required by CRIU.
+//! Without `--loom`, the standard `no-new-privileges` flag is used.
+//!
+//! Checkpoint metadata is persisted as JSON at `~/.claude-dind/loom.json`
+//! (configurable via `--loom-file`).
+//!
 //! ## Security
 //!
 //! - Credentials are held in Rust process memory only — never written to a file on the host.
@@ -41,12 +60,18 @@
 //!   then are explicitly deleted. The `--rm` flag destroys the container filesystem.
 //! - The prompt is passed via environment variable (`CLAUDE_PROMPT`), not stdin,
 //!   so it does not interfere with the credential pipe.
-//! - `--security-opt no-new-privileges` prevents privilege escalation inside the container.
+//! - In standard mode, `--security-opt no-new-privileges` prevents privilege escalation.
+//! - In loom mode, security is relaxed (`seccomp=unconfined`, `apparmor=unconfined`)
+//!   to allow CRIU's ptrace-based checkpoint operations. Credentials are stripped
+//!   from the filesystem before each checkpoint and re-injected after.
 //! - No `--privileged` flag — the container runs with default capabilities only.
 
 mod container;
 mod credentials;
+mod loom;
+mod loom_render;
 mod multiplexer;
+mod remote;
 mod render;
 mod session;
 
@@ -141,12 +166,16 @@ enum Commands {
                       claude-dind interactive --build -w ./my-project\n\n  \
                       # Re-attach to a running container:\n  \
                       claude-dind interactive --attach abc123def456\n\n  \
+                      # Enable loom (checkpoint/restore, Linux only):\n  \
+                      claude-dind interactive --build --loom\n\n  \
                       # Keybindings (tmux-style, prefix: Ctrl-b):\n  \
                       #   c     Create new session\n  \
                       #   n/p   Next/previous session\n  \
                       #   0-9   Jump to session\n  \
                       #   x     Kill current session\n  \
                       #   d     Detach (container keeps running)\n  \
+                      #   s     Take snapshot (loom mode)\n  \
+                      #   t     Show snapshot tree (loom mode)\n  \
                       #   ?     Show help"
     )]
     Interactive {
@@ -174,6 +203,66 @@ enum Commands {
         #[arg(long)]
         attach: Option<String>,
 
+        /// Enable CRIU-backed checkpoint/restore (loom mode).
+        /// Requires Docker experimental mode and CRIU installed on the host.
+        /// Linux only — not supported on macOS.
+        #[arg(long)]
+        loom: bool,
+
+        /// Path to the loom tree JSON file for checkpoint persistence.
+        #[arg(long, default_value = "~/.claude-dind/loom.json")]
+        loom_file: String,
+
+        /// Enable verbose output.
+        #[arg(long, short)]
+        verbose: bool,
+    },
+
+    /// Run a remote loom session on a GitHub Actions runner.
+    ///
+    /// Starts a gwp tunnel through a Cloudflare Worker relay, dispatches a
+    /// GitHub Actions workflow that runs the container with CRIU support,
+    /// and connects the local TUI to the remote container.
+    #[command(
+        after_help = "EXAMPLES:\n  \
+                      # Start a remote loom session:\n  \
+                      claude-dind remote --repo myuser/claude-dind \\\n    \
+                      --relay wss://gwp-relay.myaccount.workers.dev \\\n    \
+                      --relay-token mysecret --loom\n\n  \
+                      # Without loom (just remote container):\n  \
+                      claude-dind remote --repo myuser/claude-dind \\\n    \
+                      --relay wss://gwp-relay.myaccount.workers.dev \\\n    \
+                      --relay-token mysecret"
+    )]
+    Remote {
+        /// GitHub repository (owner/repo) containing the workflow.
+        #[arg(long)]
+        repo: String,
+
+        /// GitHub Actions workflow filename.
+        #[arg(long, default_value = "remote-agent.yml")]
+        workflow: String,
+
+        /// Cloudflare Worker relay URL (wss://...).
+        #[arg(long)]
+        relay: String,
+
+        /// Token for relay session pairing.
+        #[arg(long)]
+        relay_token: String,
+
+        /// Docker image to run on the runner.
+        #[arg(long, default_value = "claude-dind:latest")]
+        image: String,
+
+        /// Enable CRIU-backed checkpoint/restore (loom mode).
+        #[arg(long)]
+        loom: bool,
+
+        /// Path to the loom tree JSON file for checkpoint persistence.
+        #[arg(long, default_value = "~/.claude-dind/loom.json")]
+        loom_file: String,
+
         /// Enable verbose output.
         #[arg(long, short)]
         verbose: bool,
@@ -187,6 +276,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Prompt { .. } => run_prompt(&cli.command),
         Commands::Interactive { .. } => run_interactive(&cli.command),
+        Commands::Remote { .. } => run_remote_cmd(&cli.command),
     };
 
     match result {
@@ -265,11 +355,20 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
         workspace,
         docker_socket,
         attach,
+        loom,
+        loom_file,
         verbose,
     } = cmd
     else {
         unreachable!()
     };
+
+    // Step 0: If loom mode, verify Docker experimental is enabled
+    if *loom {
+        eprintln!("[claude-dind] Loom mode: verifying Docker experimental...");
+        container::ContainerManager::ensure_experimental()?;
+        eprintln!("[claude-dind] Docker experimental mode confirmed.");
+    }
 
     // Step 1: Build image if requested
     if *build {
@@ -277,10 +376,40 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
         build_image(&context, image, *verbose)?;
     }
 
+    // Resolve loom file path (expand ~)
+    let loom_path = if *loom {
+        let expanded = if loom_file.starts_with("~/") {
+            if let Ok(home) = env::var("HOME") {
+                PathBuf::from(format!("{}{}", home, &loom_file[1..]))
+            } else {
+                PathBuf::from(loom_file)
+            }
+        } else {
+            PathBuf::from(loom_file)
+        };
+        // Ensure parent directory exists
+        if let Some(parent) = expanded.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        Some(expanded)
+    } else {
+        None
+    };
+
     // Step 2: Start or attach to container
-    let container = if let Some(container_id) = attach {
+    let (container, creds_json) = if let Some(container_id) = attach {
         eprintln!("[claude-dind] Attaching to container {container_id}...");
-        container::ContainerManager::attach(container_id)?
+        let container = container::ContainerManager::attach(container_id)?;
+
+        // If loom mode + attach, we still need credentials for checkpoint ops
+        let creds = if *loom {
+            eprintln!("[claude-dind] Extracting credentials for loom operations...");
+            Some(credentials::extract_credentials()?)
+        } else {
+            None
+        };
+
+        (container, creds)
     } else {
         eprintln!("[claude-dind] Extracting credentials from macOS Keychain...");
         let creds = credentials::extract_credentials()?;
@@ -300,6 +429,7 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
             *verbose,
             workspace_str.as_deref(),
             &socket_str,
+            *loom,
         )?;
 
         // Wait for container to be ready (Docker socket accessible)
@@ -310,12 +440,22 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
         container.inject_credentials(&creds)?;
         eprintln!("[claude-dind] Credentials injected.");
 
-        container
+        if *loom {
+            eprintln!("[claude-dind] Loom mode active. Ctrl-b s to snapshot, Ctrl-b t for tree.");
+        }
+
+        (container, Some(creds))
     };
 
     // Step 3: Run the multiplexer TUI
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
-    let detached = rt.block_on(multiplexer::run(&container, false))?;
+    let detached = rt.block_on(multiplexer::run(
+        &container,
+        false,
+        creds_json.as_deref(),
+        loom_path.as_deref(),
+        *verbose,
+    ))?;
 
     if detached {
         eprintln!(
@@ -390,6 +530,54 @@ fn build_image(context_dir: &PathBuf, image_tag: &str, verbose: bool) -> Result<
 
     eprintln!("[claude-dind] Image built successfully.");
     Ok(())
+}
+
+/// Run in remote mode (GitHub Actions runner with gwp tunnel).
+fn run_remote_cmd(cmd: &Commands) -> Result<i32> {
+    let Commands::Remote {
+        repo,
+        workflow,
+        relay,
+        relay_token,
+        image,
+        loom,
+        loom_file,
+        verbose,
+    } = cmd
+    else {
+        unreachable!()
+    };
+
+    // Resolve loom file path (expand ~)
+    let loom_path = if *loom {
+        let expanded = if loom_file.starts_with("~/") {
+            if let Ok(home) = env::var("HOME") {
+                PathBuf::from(format!("{}{}", home, &loom_file[1..]))
+            } else {
+                PathBuf::from(loom_file)
+            }
+        } else {
+            PathBuf::from(loom_file)
+        };
+        if let Some(parent) = expanded.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        Some(expanded)
+    } else {
+        None
+    };
+
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    rt.block_on(remote::run_remote(
+        repo,
+        workflow,
+        relay,
+        relay_token,
+        image,
+        *loom,
+        loom_path.as_deref(),
+        *verbose,
+    ))
 }
 
 /// Spawns the Docker container, pipes credentials via stdin, and streams output.

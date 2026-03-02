@@ -1,0 +1,124 @@
+# Remote agent workflow for claude-dind remote loom sessions.
+#
+# Triggered by `workflow_dispatch` from the local `claude-dind remote` command.
+# Sets up a GitHub Actions runner with CRIU support, builds the gwp agent,
+# starts the container with loom flags, and connects back to the local machine
+# via the Cloudflare Worker relay.
+#
+# The runner's network traffic is routed through the local machine's IP via
+# the gwp tunnel (HTTPS_PROXY → HTTP CONNECT → yamux → local DNS/TCP).
+
+name: Remote Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      fingerprint:
+        description: 'TLS certificate fingerprint (SHA256 hex)'
+        required: true
+      token:
+        description: 'Tunnel auth token'
+        required: true
+      relay_addr:
+        description: 'Relay WebSocket URL (wss://...)'
+        required: true
+      relay_token:
+        description: 'Relay pairing token'
+        required: true
+      image:
+        description: 'Docker image to run'
+        required: false
+        default: 'claude-dind:latest'
+      loom:
+        description: 'Enable loom (CRIU checkpoint/restore)'
+        required: false
+        default: 'true'
+
+# 6-hour maximum (GitHub Actions limit)
+timeout-minutes: 360
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CRIU (if loom enabled)
+        if: inputs.loom == 'true'
+        run: |
+          sudo add-apt-repository -y ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+          # Enable Docker experimental mode for checkpoints
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info | grep -i experimental
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            extern/gh-worker-proxy/target
+          key: ${{ runner.os }}-cargo-gwp-${{ hashFiles('extern/gh-worker-proxy/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-gwp-
+
+      - name: Build gwp agent
+        run: |
+          cd extern/gh-worker-proxy
+          cargo build --release --bin gwp
+          cp target/release/gwp /usr/local/bin/gwp
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ inputs.image }} docker/
+
+      - name: Start container
+        run: |
+          DOCKER_ARGS="run -d --name claude-remote"
+          DOCKER_ARGS="$DOCKER_ARGS -v /var/run/docker.sock:/var/run/docker.sock"
+
+          if [ "${{ inputs.loom }}" = "true" ]; then
+            DOCKER_ARGS="$DOCKER_ARGS --net=host"
+            DOCKER_ARGS="$DOCKER_ARGS --security-opt seccomp=unconfined"
+            DOCKER_ARGS="$DOCKER_ARGS --security-opt apparmor=unconfined"
+          else
+            DOCKER_ARGS="$DOCKER_ARGS --security-opt no-new-privileges"
+          fi
+
+          DOCKER_ARGS="$DOCKER_ARGS --env CLAUDE_MODE=interactive"
+          DOCKER_ARGS="$DOCKER_ARGS --env HTTPS_PROXY=http://127.0.0.1:1081"
+          DOCKER_ARGS="$DOCKER_ARGS --env HTTP_PROXY=http://127.0.0.1:1081"
+
+          docker $DOCKER_ARGS ${{ inputs.image }}
+          docker ps
+
+      - name: Expose Docker socket on TCP
+        run: |
+          # socat bridges the Unix socket to TCP so the local machine can
+          # reach it via the gwp reverse port forward
+          sudo apt-get install -y socat
+          nohup socat TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock &
+          sleep 1
+          # Verify it works
+          curl -s http://127.0.0.1:2375/version | head -c 200
+          echo
+
+      - name: Start gwp agent
+        run: |
+          # This blocks until the tunnel is disconnected or the workflow is cancelled.
+          # All runner network traffic for the container goes through the tunnel.
+          gwp agent \
+            --relay "${{ inputs.relay_addr }}" \
+            --relay-token "${{ inputs.relay_token }}" \
+            --fingerprint "${{ inputs.fingerprint }}" \
+            --token "${{ inputs.token }}" \
+            --listen 127.0.0.1:1080 \
+            --http-listen 127.0.0.1:1081
