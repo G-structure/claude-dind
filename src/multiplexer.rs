@@ -1,3 +1,46 @@
+//! The interactive terminal multiplexer event loop.
+//!
+//! This module implements the main TUI loop that drives the multiplexer.
+//! It handles three concerns:
+//!
+//! 1. **Keyboard input** — Reads crossterm events, routes them through a
+//!    tmux-style prefix key state machine, and either dispatches multiplexer
+//!    commands or forwards raw bytes to the active session's PTY.
+//!
+//! 2. **Terminal output** — Polls each session's shadow-terminal for new
+//!    screen state and triggers re-renders when updates are available.
+//!
+//! 3. **Session lifecycle** — Detects when session processes exit and marks
+//!    them as dead. Exits the loop when all sessions end or the user detaches.
+//!
+//! ## Input State Machine
+//!
+//! ```text
+//!  ┌──────────┐  Ctrl-b   ┌──────────┐
+//!  │  Normal  │ ────────> │  Prefix  │
+//!  │          │ <──────── │          │
+//!  └──────────┘  any key  └──────────┘
+//!       │                      │
+//!       │   ?                  │
+//!       │   ┌──────────┐      │
+//!       └──>│   Help   │<─────┘
+//!           │          │
+//!           └──────────┘
+//!            any key → Normal
+//! ```
+//!
+//! ## Frame Rate
+//!
+//! The event loop polls for keyboard input with a 16ms timeout (~60fps).
+//! Between polls, it drains all available shadow-terminal output. This
+//! balances responsiveness with CPU usage.
+//!
+//! ## Logging
+//!
+//! Debug output is written to `/tmp/claude-dind-mux.log` with timestamps.
+//! Useful for diagnosing session lifecycle issues without interfering with
+//! the TUI display.
+
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -12,7 +55,12 @@ use crate::container::ContainerManager;
 use crate::render;
 use crate::session::SessionManager;
 
-/// The prefix key state machine.
+/// The prefix key state machine for input handling.
+///
+/// In normal mode, all keystrokes are forwarded to the active session.
+/// Pressing Ctrl-b enters prefix mode, where the next key is interpreted
+/// as a multiplexer command. The help overlay is a third state where any
+/// key dismisses it and returns to normal mode.
 enum InputMode {
     /// Normal mode: all input goes to the active session, except the prefix key.
     Normal,
@@ -23,30 +71,54 @@ enum InputMode {
 }
 
 /// Result of processing a key event in prefix mode.
+///
+/// After the user presses Ctrl-b (the prefix key), the next keystroke
+/// is decoded into one of these actions.
 enum PrefixAction {
+    /// `c` — Create a new Claude Code session.
     CreateSession,
+    /// `n` — Switch to the next session (wraps around).
     NextSession,
+    /// `p` — Switch to the previous session (wraps around).
     PrevSession,
+    /// `0`-`9` — Jump directly to a session by its index.
     JumpToSession(usize),
+    /// `x` — Kill the currently active session.
     KillSession,
+    /// `d` — Detach from the TUI (container keeps running).
     Detach,
+    /// `?` — Toggle the help overlay.
     ShowHelp,
-    /// The prefix key was pressed again — send a literal Ctrl-b to the session.
+    /// `Ctrl-b` — The prefix key was pressed again; send a literal 0x02 byte
+    /// to the active session (escape hatch for programs that use Ctrl-b).
     SendPrefix,
-    /// Unknown key after prefix — ignore.
+    /// Any other key — ignore and return to normal mode.
     Ignore,
 }
 
 /// Main entry point for the interactive multiplexer TUI.
 ///
-/// This function:
-/// 1. Sets up crossterm raw mode and alternate screen
-/// 2. Creates a ratatui terminal
-/// 3. Runs the main event loop (poll terminal output + handle keyboard input)
-/// 4. Cleans up on exit
+/// This function takes ownership of the host terminal for the duration of
+/// the multiplexer session. It:
 ///
-/// Returns `true` if the user detached (container should keep running),
-/// `false` if all sessions ended or an error occurred.
+/// 1. Enables crossterm raw mode (disables line buffering, echo, signal handling)
+/// 2. Enters the alternate screen buffer (preserves the user's terminal history)
+/// 3. Creates a ratatui terminal backed by crossterm
+/// 4. Creates the first Claude session automatically
+/// 5. Runs the main event loop until all sessions end or the user detaches
+/// 6. Restores the terminal to its original state on exit
+///
+/// # Returns
+///
+/// - `Ok(true)` if the user detached (`Ctrl-b d`) — the container should keep running
+/// - `Ok(false)` if all sessions ended naturally — the container should be stopped
+/// - `Err(...)` on unrecoverable errors
+///
+/// # Arguments
+///
+/// - `container` — The running DinD container to create sessions in
+/// - `detach_on_exit` — If true, exit the loop when all sessions end instead of
+///   keeping the TUI alive waiting for new sessions
 pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<bool> {
     // Open a log file for debugging (append mode)
     let mut log = OpenOptions::new()
@@ -217,6 +289,9 @@ pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<b
 }
 
 /// Decode a key event in prefix mode into a multiplexer action.
+///
+/// Called after the user has pressed Ctrl-b (the prefix key). Maps the
+/// follow-up keystroke to a [`PrefixAction`].
 fn decode_prefix_key(key: KeyEvent) -> PrefixAction {
     match key.code {
         KeyCode::Char('c') => PrefixAction::CreateSession,
@@ -237,7 +312,20 @@ fn decode_prefix_key(key: KeyEvent) -> PrefixAction {
     }
 }
 
-/// Convert a crossterm KeyEvent into bytes to send to the PTY.
+/// Convert a crossterm [`KeyEvent`] into raw bytes to send to the PTY.
+///
+/// Translates keyboard events into the byte sequences that a terminal
+/// program expects to receive:
+///
+/// - **Ctrl+key**: Ctrl+a = 0x01, Ctrl+b = 0x02, ..., Ctrl+z = 0x1a
+/// - **Printable characters**: UTF-8 encoded bytes
+/// - **Enter**: `\r` (carriage return, not `\n`)
+/// - **Backspace**: 0x7f (DEL, the standard terminal backspace)
+/// - **Escape sequences**: Arrow keys, function keys, Home/End, etc.
+///   use VT100/xterm escape sequences (e.g., `\x1b[A` for Up arrow)
+///
+/// Returns `None` for keys that have no PTY representation (e.g.,
+/// modifier-only keys, unrecognized function keys).
 fn key_event_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     // Handle Ctrl+key combinations
     if key.modifiers.contains(KeyModifiers::CONTROL) {

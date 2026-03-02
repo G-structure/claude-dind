@@ -1,3 +1,32 @@
+//! Long-lived Docker-in-Docker container management.
+//!
+//! In interactive mode, a single DinD container stays alive while the
+//! multiplexer creates/kills individual Claude Code sessions inside it via
+//! `docker exec`. This module manages that container's lifecycle:
+//!
+//! - **Start**: `docker run -d --privileged --env CLAUDE_MODE=interactive`
+//! - **Credential injection**: Writes the credential JSON into the container's
+//!   filesystem via `docker exec -i` with stdin piping (avoids credentials
+//!   appearing in process arguments visible to `ps`/`docker inspect`)
+//! - **Health checks**: Polls `docker info` inside the container to wait for
+//!   the Docker daemon to be ready
+//! - **Attach**: Reconnects to an already-running container by ID
+//! - **Stop**: `docker rm -f` for cleanup
+//!
+//! ## Credential Injection
+//!
+//! Unlike prompt mode (where credentials are piped to the container's PID 1
+//! via stdin), interactive mode injects credentials after the container is
+//! already running:
+//!
+//! ```text
+//! echo $JSON | docker exec -i <id> sh -c 'cat > ~/.claude/.credentials.json'
+//! ```
+//!
+//! The JSON is piped through `docker exec`'s stdin rather than passed as a
+//! command argument. This prevents the credential from appearing in the
+//! process table, `docker inspect`, or Docker's event log.
+
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 

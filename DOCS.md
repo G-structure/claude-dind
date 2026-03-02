@@ -9,6 +9,9 @@
   - [Token Refresh](#token-refresh)
   - [Cross-Platform Credential Storage](#cross-platform-credential-storage)
 - [Architecture Overview](#architecture-overview)
+  - [Prompt Mode](#prompt-mode-architecture)
+  - [Interactive Mode](#interactive-mode-architecture)
+- [Module Structure](#module-structure)
 - [Design Decisions](#design-decisions)
   - [Why Rust?](#why-rust)
   - [Why Shell Out to `security` Instead of Using a Crate?](#why-shell-out-to-security-instead-of-using-a-crate)
@@ -16,13 +19,28 @@
   - [Why a Single DinD Image Instead of Nested Containers?](#why-a-single-dind-image-instead-of-nested-containers)
   - [Why a Non-Root User Inside the Container?](#why-a-non-root-user-inside-the-container)
   - [Why --dangerously-skip-permissions?](#why---dangerously-skip-permissions)
+  - [Why shadow-terminal?](#why-shadow-terminal)
+  - [Why a Long-Lived Container for Interactive Mode?](#why-a-long-lived-container-for-interactive-mode)
 - [Component Deep Dive](#component-deep-dive)
-  - [The Rust CLI (`src/main.rs`)](#the-rust-cli-srcmainrs)
+  - [Credential Extraction (`src/credentials.rs`)](#credential-extraction-srccredentialsrs)
+  - [Container Management (`src/container.rs`)](#container-management-srccontainerrs)
+  - [Session Management (`src/session.rs`)](#session-management-srcsessionrs)
+  - [Terminal Rendering (`src/render.rs`)](#terminal-rendering-srcrenderrs)
+  - [Multiplexer Event Loop (`src/multiplexer.rs`)](#multiplexer-event-loop-srcmultiplexerrs)
+  - [CLI Entry Point (`src/main.rs`)](#cli-entry-point-srcmainrs)
   - [The Dockerfile (`docker/Dockerfile`)](#the-dockerfile-dockerdockerfile)
   - [The Entrypoint Script (`docker/entrypoint.sh`)](#the-entrypoint-script-dockerentrypointsh)
-- [Data Flow: End to End](#data-flow-end-to-end)
+- [Data Flow](#data-flow)
+  - [Prompt Mode: End to End](#prompt-mode-end-to-end)
+  - [Interactive Mode: End to End](#interactive-mode-end-to-end)
 - [Security Model](#security-model)
 - [Usage](#usage)
+  - [Prerequisites](#prerequisites)
+  - [Building](#building)
+  - [Prompt Mode](#prompt-mode-usage)
+  - [Interactive Mode](#interactive-mode-usage)
+  - [Keybindings](#keybindings)
+  - [Exit Codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
 - [Limitations and Future Work](#limitations-and-future-work)
 
@@ -48,6 +66,9 @@ This matters for several use cases:
    environment regardless of the host OS.
 3. **Agent swarm infrastructure** -- Spin up multiple Claude Code instances in parallel,
    each in its own container, all authenticated with the same subscription.
+4. **Interactive multiplexing** -- Manage multiple concurrent Claude Code sessions in a
+   single container through a tmux-style terminal multiplexer, enabling parallel
+   workflows with session switching.
 
 The challenge is that Claude Code's authentication system was not designed for this. The
 tokens live in the macOS Keychain, and there is no documented mechanism to transplant
@@ -206,6 +227,11 @@ path that Claude Code expects.
 
 ## Architecture Overview
 
+claude-dind operates in two modes: **prompt** (ephemeral, one-shot) and **interactive**
+(long-lived, multiplexed).
+
+### Prompt Mode Architecture
+
 ```
                           macOS Host
  ┌──────────────────────────────────────────────────────┐
@@ -219,7 +245,7 @@ path that Claude Code expects.
  │               │ security find-generic-password -w     │
  │               │                                      │
  │  ┌────────────▼─────────────┐                        │
- │  │ claude-dind (Rust CLI)   │                        │
+ │  │ claude-dind prompt "..." │                        │
  │  │                          │                        │
  │  │  1. Extract creds        │                        │
  │  │  2. Validate JSON        │                        │
@@ -238,9 +264,9 @@ path that Claude Code expects.
     │  Docker Container (claude-dind:latest)             │
     │  Base: docker:dind + nodejs + claude-code          │
     │                                                    │
-    │  entrypoint.sh:                                    │
+    │  entrypoint.sh (CLAUDE_MODE=prompt):               │
     │                                                    │
-    │  Phase 1: cat (stdin) → $CREDS_JSON               │
+    │  Phase 1: cat (stdin) -> $CREDS_JSON               │
     │           Validate with jq                         │
     │                                                    │
     │  Phase 2: Write to                                 │
@@ -260,18 +286,90 @@ path that Claude Code expects.
     └───────────────────────────────────────────────────┘
 ```
 
+### Interactive Mode Architecture
+
+```
+                          macOS Host
+ ┌───────────────────────────────────────────────────────────┐
+ │                                                           │
+ │  macOS Keychain                                           │
+ │  ┌──────────────────────────┐                             │
+ │  │ Claude Code-credentials  │                             │
+ │  └────────────┬─────────────┘                             │
+ │               │                                           │
+ │  ┌────────────▼───────────────────────────────────────┐   │
+ │  │ claude-dind interactive (Rust TUI on host)         │   │
+ │  │                                                    │   │
+ │  │  ┌──────────────────────────────────────────────┐  │   │
+ │  │  │ Multiplexer (ratatui + crossterm)            │  │   │
+ │  │  │                                              │  │   │
+ │  │  │  Status bar: [0:claude-1*] [1:claude-2]      │  │   │
+ │  │  │  Ctrl-b prefix keybindings (tmux-style)      │  │   │
+ │  │  │                                              │  │   │
+ │  │  │  ┌────────────┐  ┌────────────┐              │  │   │
+ │  │  │  │ Session 1  │  │ Session 2  │  ...         │  │   │
+ │  │  │  │ (active)   │  │            │              │  │   │
+ │  │  │  └─────┬──────┘  └─────┬──────┘              │  │   │
+ │  │  │        │               │                     │  │   │
+ │  │  │  shadow-terminal ActiveTerminal instances     │  │   │
+ │  │  └────────┼───────────────┼─────────────────────┘  │   │
+ │  │           │               │                        │   │
+ │  │     docker exec      docker exec                   │   │
+ │  └───────────┼───────────────┼────────────────────────┘   │
+ │              │               │                            │
+ └──────────────┼───────────────┼────────────────────────────┘
+                │               │
+   ┌────────────▼───────────────▼───────────────────────┐
+   │  Long-lived DinD Container                         │
+   │  (CLAUDE_MODE=interactive)                         │
+   │                                                    │
+   │  ┌──────────┐                                      │
+   │  │ dockerd  │  (shared Docker daemon)              │
+   │  └──────────┘                                      │
+   │                                                    │
+   │  /home/claude/.claude/.credentials.json             │
+   │  (injected via docker exec after startup)          │
+   │                                                    │
+   │  claude session 1  (docker exec -it ... claude)    │
+   │  claude session 2  (docker exec -it ... claude)    │
+   │  ...                                               │
+   └────────────────────────────────────────────────────┘
+```
+
 The system has three components:
 
 1. **Rust CLI** (`claude-dind`) -- Runs on the macOS host. Extracts credentials from
-   the Keychain, manages the Docker lifecycle, and pipes credentials into the container.
+   the Keychain, manages Docker containers, and in interactive mode provides a terminal
+   multiplexer TUI.
 
 2. **Docker image** (`claude-dind:latest`) -- A single image based on `docker:dind` with
    Node.js and Claude Code installed. Provides both a Docker daemon (for DinD) and the
    Claude Code CLI.
 
-3. **Entrypoint script** -- Orchestrates the container startup: reads credentials from
-   stdin, writes them to disk, starts the Docker daemon, runs Claude Code as a non-root
-   user, then cleans up.
+3. **Entrypoint script** -- Orchestrates the container startup. In prompt mode: reads
+   credentials from stdin, starts dockerd, runs Claude, cleans up. In interactive mode:
+   starts dockerd, then sleeps forever (sessions created via `docker exec`).
+
+---
+
+## Module Structure
+
+```
+src/
+├── main.rs            CLI entry point (clap subcommands: prompt, interactive)
+├── credentials.rs     macOS Keychain extraction via `security` CLI
+├── container.rs       ContainerManager: start/stop/attach long-lived DinD containers
+├── session.rs         SessionManager: shadow-terminal ActiveTerminal + docker exec
+├── multiplexer.rs     TUI event loop, Ctrl-b prefix keybindings, input dispatch
+└── render.rs          ratatui rendering: TerminalWidget, status bar, help overlay
+
+docker/
+├── Dockerfile         docker:dind + Node.js + Claude Code + non-root user
+└── entrypoint.sh      Container startup (prompt mode and interactive mode)
+
+extern/
+└── shadow-terminal/   Headless terminal emulator (gitignored, cloned separately)
+```
 
 ---
 
@@ -290,12 +388,12 @@ Rust was chosen for the host-side CLI because:
    The borrow checker ensures the stdin pipe is dropped (closed) at exactly the right
    moment.
 
-3. **Consistency with the parent project.** The `agent_swarm` project already uses Rust
-   for its CLI tooling.
+3. **Ecosystem for TUI applications.** ratatui + crossterm provide a mature, well-tested
+   foundation for building terminal multiplexer UIs. The shadow-terminal crate (built on
+   wezterm-term) gives us full ANSI terminal emulation in-process.
 
-4. **Minimal dependencies.** The project uses only four crates: `anyhow` (error
-   handling), `clap` (argument parsing), `serde`/`serde_json` (JSON validation). No
-   HTTP clients, no async runtimes, no credential libraries.
+4. **Consistency with the parent project.** The `agent_swarm` project already uses Rust
+   for its CLI tooling.
 
 ### Why Shell Out to `security` Instead of Using a Crate?
 
@@ -337,8 +435,8 @@ We considered three approaches for injecting credentials into the container:
   filesystem journals or swap. This violates the design goal of credentials never touching
   the host filesystem.
 
-**Option C: stdin piping (chosen).** Write the JSON to the container's stdin, then close
-the pipe.
+**Option C: stdin piping (chosen for prompt mode).** Write the JSON to the container's
+stdin, then close the pipe.
 - The credential exists only in memory on the host (in the Rust process's heap).
 - The pipe is a kernel-level construct -- the data flows directly from the Rust process
   to the container's PID 1 without intermediate storage.
@@ -347,8 +445,10 @@ the pipe.
 - Inside the container, the credential is written to a file only for the duration of the
   Claude Code process, then immediately deleted.
 
-The stdin approach provides the strongest security guarantees with the simplest
-implementation.
+**Interactive mode uses `docker exec` injection.** Since the container is already running
+(no stdin pipe available), credentials are written via `docker exec -i <id> sh -c 'cat >
+/home/claude/.claude/.credentials.json'` with the JSON piped to the exec's stdin. This
+avoids credentials appearing in process arguments.
 
 ### Why a Single DinD Image Instead of Nested Containers?
 
@@ -403,50 +503,174 @@ credential pipe, there is no way for the user to respond to permission prompts. 
 `--dangerously-skip-permissions` flag tells Claude Code to auto-approve all tool uses.
 
 This is acceptable because:
-1. The container is ephemeral (`--rm` deletes it after exit).
+1. The container is ephemeral (`--rm` deletes it after exit) or isolated (interactive mode).
 2. The container is isolated from the host filesystem.
 3. The user explicitly chose to run this command and provided the prompt.
 4. The DinD environment means even Docker operations are contained.
+
+### Why shadow-terminal?
+
+Interactive mode needs to display Claude Code's TUI output (which uses ANSI escape
+sequences, colors, Unicode, cursor movement) inside a ratatui widget. This requires
+full terminal emulation -- not just capturing raw bytes, but parsing them into a virtual
+screen buffer.
+
+[shadow-terminal](https://github.com/nichochar/shadow-terminal) provides this via:
+
+1. **wezterm-term** -- A battle-tested terminal emulator core (from the WezTerm project)
+   that parses VT100/xterm escape sequences into a cell grid with color and attribute
+   metadata.
+
+2. **portable-pty** -- Cross-platform PTY abstraction. Each Claude session runs inside a
+   real PTY allocated by portable-pty, so programs like `docker exec -it` that require
+   `isatty()` to return true work correctly.
+
+3. **Channel-based I/O** -- `ActiveTerminal` exposes async channels: `send_input()` for
+   keystrokes and `surface_output_rx` for rendered terminal state (as termwiz `Surface`
+   objects containing cell grids with full color/attribute information).
+
+The alternative would be implementing our own VT100 parser or using a less featureful
+library. shadow-terminal gives us Claude Code's full TUI rendered correctly, including
+syntax highlighting, spinners, and markdown formatting.
+
+### Why a Long-Lived Container for Interactive Mode?
+
+Prompt mode creates an ephemeral container per invocation. Interactive mode instead starts
+a single container that stays alive:
+
+1. **Avoids re-injecting credentials** for every new session. Credentials are injected
+   once after startup.
+2. **Avoids restarting dockerd** every time. The Docker daemon starts once and serves all
+   sessions.
+3. **Enables detach/reattach.** The user can `Ctrl-b d` to detach from the TUI while the
+   container continues running. `claude-dind interactive --attach <id>` reconnects.
+4. **Shared filesystem.** Multiple Claude sessions can read/write the same `/workspace`,
+   enabling collaborative workflows.
 
 ---
 
 ## Component Deep Dive
 
-### The Rust CLI (`src/main.rs`)
+### Credential Extraction (`src/credentials.rs`)
 
-The CLI has five functions:
+`extract_credentials() -> Result<String>` -- Reads the credential JSON from the macOS
+Keychain. Determines the account name from `$USER` or `$LOGNAME`. Calls `security
+find-generic-password -s "Claude Code-credentials" -a <username> -w`. Parses the
+returned JSON and validates that `claudeAiOauth.accessToken` exists. Returns the raw
+JSON string.
 
-**`extract_credentials()`** -- Calls `security find-generic-password` to read the
-credential JSON from the macOS Keychain. It determines the account name from the `USER`
-or `LOGNAME` environment variable. After extraction, it validates that the JSON parses
-correctly and contains the expected `claudeAiOauth.accessToken` field. This fail-fast
-validation catches the case where the user hasn't logged into Claude Code yet.
+### Container Management (`src/container.rs`)
 
-**`resolve_docker_context()`** -- Finds the `docker/` directory containing the Dockerfile.
-It checks three locations: an explicit `--docker-context` argument, the path relative to
-the binary's location (for installed binaries), and the path relative to the current
-working directory (for development). This means `cargo run -- --build "..."` works from
-the project root without any extra arguments.
+`ContainerManager` wraps a long-lived DinD container. Key methods:
 
-**`build_image()`** -- Runs `docker build -t <tag> .` in the context directory. In
-non-verbose mode, it passes `--quiet` to suppress layer-by-layer output.
+- **`start(image, verbose)`** -- `docker run -d --privileged --env CLAUDE_MODE=interactive`
+  to create a detached container. Returns the container ID.
+- **`attach(container_id)`** -- Connects to an already-running container. Verifies it is
+  still running via `docker inspect`.
+- **`inject_credentials(creds_json)`** -- Writes the credential JSON into the container
+  via `docker exec -i <id> sh -c 'cat > /home/claude/.claude/.credentials.json'`. The
+  JSON is piped through stdin to avoid appearing in process arguments.
+- **`wait_for_dockerd(timeout)`** -- Polls `docker exec <id> docker info` until the
+  daemon is ready (or timeout).
+- **`stop()`** -- `docker rm -f <id>`.
+- **`is_running()`** -- `docker inspect --format {{.State.Running}}`.
+- **`short_id()`** -- First 12 characters of the container ID for display.
 
-**`run_container()`** -- The core function. It spawns `docker run` with:
-- `--privileged` (required for DinD -- dockerd needs kernel capabilities)
-- `-i` (keep stdin open so the pipe works)
-- `--rm` (auto-remove container after exit, unless `--keep` is set)
-- `--env CLAUDE_PROMPT=...` (pass the user's prompt)
-- `--env CLAUDE_FLAGS=...` (optional extra flags)
+### Session Management (`src/session.rs`)
 
-The function uses `Stdio::piped()` for stdin and `Stdio::inherit()` for stdout/stderr.
-After spawning, it writes the credential JSON to the child's stdin, then drops the
-`ChildStdin` handle. In Rust, dropping the handle closes the pipe's write end, which
-sends EOF to the container. This is the mechanism that tells the entrypoint "I'm done
-sending credentials, you can proceed."
+`SessionManager` creates and manages Claude Code sessions inside the container, each
+wrapped in a shadow-terminal `ActiveTerminal`.
 
-**`run()`** -- Orchestrates the flow: build (optional) -> extract credentials -> run
-container. Returns the container's exit code, which the `main()` function forwards as
-the process exit code.
+**Session creation** (`create(width, height)`):
+```
+bash -c "docker exec -it <container_id> su -l claude -c \
+  'export PATH=/usr/local/bin:/usr/bin:/bin:$PATH && \
+   cd /workspace && \
+   claude --dangerously-skip-permissions'"
+```
+The command is wrapped in `bash -c` to ensure proper TTY inheritance from portable-pty's
+PTY slave to docker exec. Each session gets a shadow-terminal `Config` with the specified
+dimensions and a 5000-line scrollback buffer.
+
+**Input** (`send_input(idx, bytes)`): Chunks input bytes into 128-byte buffers
+(shadow-terminal's `BytesFromSTDIN` type) and sends them via the `ActiveTerminal`'s
+async channel.
+
+**Output** (`poll_output(idx)`): Drains the `surface_output_rx` channel. Handles two
+variants:
+- `Output::Complete(CompleteSurface)` -- Full screen replacement (new `Surface`).
+- `Output::Diff(SurfaceDiff)` -- Incremental changes applied to the existing `Surface`.
+
+Other methods: `kill()`, `cleanup_exited()`, `resize_all()`, `next()`, `prev()`,
+`switch_to()`, `count()`.
+
+### Terminal Rendering (`src/render.rs`)
+
+`render_frame()` splits the terminal into two areas:
+1. **Terminal area** (fills available space) -- Renders the active session's termwiz
+   `Surface` via a custom `TerminalWidget`.
+2. **Status bar** (1 line) -- Shows session tabs with active indicator and help hint.
+
+**`TerminalWidget`**: Implements `ratatui::Widget`. Iterates through `surface.screen_lines()`
+and `line.cells()`, mapping each termwiz cell to a ratatui buffer cell. Converts:
+- `ColorAttribute` (Default, PaletteIndex, TrueColor variants) to `ratatui::Color`
+- `CellAttributes` (intensity, italic, underline, strikethrough, reverse) to `ratatui::Modifier`
+- Cell text via `cell.str()`
+
+**Status bar**: `[0:claude-1*] [1:claude-2]  Ctrl-b ? for help` -- Active session
+highlighted in green, exited sessions dimmed, help hint right-aligned in yellow.
+
+**Help overlay**: Centered bordered panel listing all keybindings, rendered above the
+terminal content.
+
+### Multiplexer Event Loop (`src/multiplexer.rs`)
+
+`run(container, detach_on_exit) -> Result<bool>` -- Main async event loop.
+
+**State machine** for input handling:
+- **Normal mode**: All keys forwarded to the active session, except `Ctrl-b` which
+  enters prefix mode.
+- **Prefix mode**: Next key is interpreted as a multiplexer command:
+  - `c` -- Create new session
+  - `n` / `p` -- Next / previous session
+  - `0`-`9` -- Jump to session by index
+  - `x` -- Kill current session
+  - `d` -- Detach (returns `true` to keep container running)
+  - `?` -- Show help overlay
+  - `Ctrl-b` -- Send literal `Ctrl-b` (0x02) to session
+- **Help mode**: Any key dismisses the overlay.
+
+**Key-to-bytes conversion** (`key_event_to_bytes`): Translates crossterm `KeyEvent` into
+PTY-compatible byte sequences. Handles Ctrl+key combinations (0x01-0x1a), UTF-8
+characters, special keys (Enter=`\r`, Backspace=0x7f, Esc=0x1b), arrow keys, function
+keys (F1-F12), Home, End, PageUp, PageDown, Insert, Delete.
+
+**Session lifecycle**: Polls `task_handle.is_finished()` on each frame to detect when a
+session's docker exec process has exited. Marks it `exited = true` for the renderer.
+
+**Frame rate**: Polls for keyboard events with a 16ms timeout (~60fps), balancing
+responsiveness with CPU usage.
+
+**Logging**: Writes debug output to `/tmp/claude-dind-mux.log` with timestamps. Logs
+session creation, output events (first 50 frames), task completion, and input errors.
+
+### CLI Entry Point (`src/main.rs`)
+
+Two clap subcommands:
+
+**`claude-dind prompt <prompt> [options]`** -- Original ephemeral mode.
+- Extracts credentials, spawns `docker run --privileged -i --rm`, pipes credentials via
+  stdin, streams output. Options: `--build`, `--image`, `--docker-context`,
+  `--claude-flags`, `--keep`, `--dump-creds`, `-v`.
+
+**`claude-dind interactive [options]`** -- Multiplexer mode.
+- Starts (or attaches to) a long-lived container. Injects credentials. Creates a tokio
+  runtime and runs the multiplexer TUI. On detach, prints the container ID for
+  reattachment. On normal exit (all sessions ended), stops the container. Options:
+  `--build`, `--image`, `--docker-context`, `--attach <id>`, `-v`.
+
+Helper functions: `resolve_docker_context()` (finds the `docker/` directory),
+`build_image()` (runs `docker build`), `run_container()` (prompt mode Docker lifecycle).
 
 ### The Dockerfile (`docker/Dockerfile`)
 
@@ -454,112 +678,118 @@ Built on `docker:dind` (Alpine Linux with Docker daemon and CLI).
 
 Layer by layer:
 
-1. **`apk add nodejs npm bash jq shadow sudo`** -- Installs Node.js (for Claude Code),
-   bash (the entrypoint uses bash features), jq (for credential validation), shadow
-   (provides `useradd`/`usermod`), and sudo (for the claude user).
+1. **`apk add nodejs npm bash jq shadow sudo`** -- Node.js (for Claude Code), bash
+   (entrypoint uses bash features), jq (credential validation), shadow (`useradd`/
+   `usermod`), sudo (for the claude user).
 
-2. **`npm install -g @anthropic-ai/claude-code`** -- Installs Claude Code globally.
-   This places the `claude` binary in `/usr/local/bin/`.
+2. **`npm install -g @anthropic-ai/claude-code`** -- Installs Claude Code globally at
+   `/usr/local/bin/claude`.
 
-3. **`useradd -m -s /bin/bash claude`** -- Creates the non-root user. Adds sudo access
+3. **`useradd -m -s /bin/bash claude`** -- Creates the non-root user with sudo access
    and Docker group membership.
 
-4. **Pre-creates `~/.claude/` and `~/.claude.json`** -- The `.claude.json` file with
-   `{"hasCompletedOnboarding": true}` bypasses the first-run onboarding prompt that
-   would otherwise block non-interactive execution.
+4. **Pre-creates `~/.claude/` and `~/.claude.json`** -- Bypasses the first-run
+   onboarding prompt with `{"hasCompletedOnboarding": true}`.
 
-5. **Creates `/workspace`** -- The working directory where Claude Code operates.
+5. **Creates `/workspace`** -- Working directory for Claude Code operations.
 
 ### The Entrypoint Script (`docker/entrypoint.sh`)
 
-The entrypoint runs as root (PID 1 in the container) and has five phases:
+Supports two modes via `$CLAUDE_MODE`:
 
-**Phase 1: Read credentials from stdin.**
-- First checks if stdin is a terminal (`[ -t 0 ]`). If it is, the container was started
-  interactively without piped input -- this is an error.
-- Reads all of stdin into `$CREDS_JSON` using `cat`. Because the Rust CLI has already
-  closed the pipe by this point, `cat` returns immediately with the full JSON blob.
-- Validates the JSON with `jq -e '.claudeAiOauth.accessToken'`. This catches corrupted
-  or truncated credentials before Claude Code tries to use them.
+**Both modes** start dockerd first:
+- Runs `dockerd-entrypoint.sh dockerd &` in the background.
+- Polls `docker info` until ready (up to 30s timeout).
 
-**Phase 2: Write credentials to disk.**
-- Writes the JSON to `/home/claude/.claude/.credentials.json` -- the path Claude Code
-  checks on Linux for its file-based credential storage.
-- Sets `chmod 600` (owner read/write only) and `chown claude:claude`.
+**Interactive mode** (`CLAUDE_MODE=interactive`):
+- After dockerd is ready, traps SIGTERM/SIGINT for graceful shutdown.
+- Enters a `while true; do sleep 86400 & wait; done` loop.
+- Sessions and credentials are managed externally via `docker exec`.
 
-**Phase 3: Start the Docker daemon.**
-- Runs `dockerd-entrypoint.sh dockerd &` in the background. This is the standard DinD
-  startup script included in the `docker:dind` image.
-- Polls `docker info` in a loop, waiting up to 30 seconds for the daemon to be ready.
-  In practice, dockerd starts in under 1 second on OrbStack and 2-5 seconds on Docker
-  Desktop.
-
-**Phase 4: Run Claude Code.**
-- Reads the prompt from the `CLAUDE_PROMPT` environment variable.
-- Runs `su -l claude -c "claude -p <prompt> --dangerously-skip-permissions"`.
-- The `su -l` starts a login shell for the `claude` user. The explicit `PATH` export
-  ensures `/usr/local/bin` (where `claude` is installed) is in the path, since `su -l`
-  resets the environment.
-
-**Phase 5: Cleanup.**
-- Deletes `.credentials.json` from disk.
-- Kills the dockerd process.
-- Exits with Claude Code's exit code, so the Rust CLI can forward it to the caller.
+**Prompt mode** (`CLAUDE_MODE=prompt`, the default):
+- Phase 1: Reads credential JSON from stdin via `cat`. Validates with `jq`.
+- Phase 2: Writes to `/home/claude/.claude/.credentials.json` with `chmod 600`.
+- Phase 4: Runs `su -l claude -c "claude -p <prompt> --dangerously-skip-permissions"`.
+- Phase 5: Deletes credentials, kills dockerd, exits with Claude's exit code.
 
 ---
 
-## Data Flow: End to End
+## Data Flow
+
+### Prompt Mode: End to End
 
 ```
-Step 1: Rust CLI reads macOS Keychain
-        security find-generic-password -s "Claude Code-credentials" -a "<your-username>" -w
-        → returns JSON blob (in memory, never written to disk)
+Step 1:  Rust CLI reads macOS Keychain
+         security find-generic-password -s "Claude Code-credentials" -w
+         -> returns JSON blob (in memory, never written to disk)
 
-Step 2: Rust CLI validates JSON
-        serde_json::from_str() → check .claudeAiOauth.accessToken exists
+Step 2:  Rust CLI validates JSON
+         serde_json::from_str() -> check .claudeAiOauth.accessToken exists
 
-Step 3: Rust CLI spawns Docker child process
-        Command::new("docker")
-          .args(["run", "--privileged", "-i", "--rm", "--env", "CLAUDE_PROMPT=...", "claude-dind:latest"])
-          .stdin(Stdio::piped())
-          .stdout(Stdio::inherit())
-          .stderr(Stdio::inherit())
-          .spawn()
+Step 3:  Rust CLI spawns Docker child process
+         docker run --privileged -i --rm --env CLAUDE_PROMPT="..." claude-dind:latest
 
-Step 4: Rust CLI writes credentials to child's stdin pipe
-        child.stdin.write_all(json_bytes)
+Step 4:  Rust CLI writes credentials to child's stdin pipe
+         child.stdin.write_all(json_bytes)
 
-Step 5: Rust CLI drops stdin handle
-        } // ChildStdin dropped here → write end of pipe closed → EOF sent
+Step 5:  Rust CLI drops stdin handle -> EOF sent to container
 
-Step 6: Container entrypoint reads stdin
-        CREDS_JSON=$(cat)  ← reads until EOF, gets full JSON
+Step 6:  Container entrypoint starts dockerd, waits for readiness
 
-Step 7: Container validates with jq
-        echo "$CREDS_JSON" | jq -e '.claudeAiOauth.accessToken'
+Step 7:  Container entrypoint reads stdin (gets full JSON)
 
-Step 8: Container writes credential file
-        echo "$CREDS_JSON" > /home/claude/.claude/.credentials.json
+Step 8:  Container validates with jq, writes to ~/.claude/.credentials.json
 
-Step 9: Container starts dockerd
-        dockerd-entrypoint.sh dockerd &
-        while ! docker info; do sleep 1; done
+Step 9:  Container runs Claude Code as non-root user
 
-Step 10: Container runs Claude Code as non-root user
-         su -l claude -c "claude -p '$PROMPT' --dangerously-skip-permissions"
+Step 10: Claude Code authenticates with Anthropic OAuth servers
 
-Step 11: Claude Code reads ~/.claude/.credentials.json, authenticates with
-         Anthropic's OAuth servers using the access token (or refreshes if expired)
+Step 11: Claude Code executes the prompt, output streams to container stdout
 
-Step 12: Claude Code executes the prompt, output streams to container stdout
+Step 12: Container stdout inherited by Rust CLI -> streams to user's terminal
 
-Step 13: Container stdout/stderr inherited by Rust CLI → streams to user's terminal
+Step 13: Claude Code exits -> entrypoint deletes .credentials.json -> kills dockerd
 
-Step 14: Claude Code exits → entrypoint deletes .credentials.json → kills dockerd
+Step 14: Container exits -> Docker removes it (--rm) -> all traces gone
 
-Step 15: Container exits → Docker removes it (--rm) → all traces gone
+Step 15: Rust CLI forwards container's exit code as its own
+```
 
-Step 16: Rust CLI forwards container's exit code as its own
+### Interactive Mode: End to End
+
+```
+Step 1:  Rust CLI reads macOS Keychain (same as prompt mode)
+
+Step 2:  Rust CLI starts detached container
+         docker run -d --privileged --env CLAUDE_MODE=interactive claude-dind:latest
+
+Step 3:  Container entrypoint starts dockerd, waits for readiness,
+         then enters infinite sleep loop
+
+Step 4:  Rust CLI waits for dockerd inside container (polls docker exec <id> docker info)
+
+Step 5:  Rust CLI injects credentials via docker exec
+         echo $JSON | docker exec -i <id> sh -c 'cat > ~/.claude/.credentials.json'
+
+Step 6:  Rust CLI enters TUI mode (crossterm raw mode + ratatui alternate screen)
+
+Step 7:  Multiplexer creates first session:
+         shadow-terminal spawns:
+         bash -c "docker exec -it <id> su -l claude -c 'claude --dangerously-skip-permissions'"
+
+Step 8:  Session I/O loop:
+         - Keyboard input -> key_event_to_bytes -> send_input -> PTY -> docker exec -> claude
+         - claude output -> PTY -> shadow-terminal -> Surface -> TerminalWidget -> ratatui
+
+Step 9:  User can create/switch/kill sessions via Ctrl-b prefix commands
+
+Step 10: On detach (Ctrl-b d): TUI exits, container keeps running
+         User sees: "Re-attach with: claude-dind interactive --attach <short-id>"
+
+Step 11: On reattach: Rust CLI connects to existing container, re-enters TUI
+         (existing sessions are gone; new sessions are created)
+
+Step 12: When all sessions end: container is stopped and removed
 ```
 
 ---
@@ -568,7 +798,8 @@ Step 16: Rust CLI forwards container's exit code as its own
 
 **Threat: Credential exposure on host filesystem.**
 Mitigation: Credentials are extracted from Keychain into Rust process memory and piped
-directly to Docker's stdin. They never exist as a file on the host.
+directly to Docker's stdin (prompt mode) or via `docker exec -i` stdin (interactive
+mode). They never exist as a file on the host.
 
 **Threat: Credential exposure in Docker metadata.**
 Mitigation: Credentials are passed via stdin, not environment variables. `docker inspect`
@@ -576,26 +807,31 @@ will not show them. The `CLAUDE_PROMPT` env var is visible, but it contains only
 user's prompt, not credentials.
 
 **Threat: Credential persistence in container.**
-Mitigation: The entrypoint explicitly deletes `.credentials.json` before exiting. The
-`--rm` flag ensures the container's entire filesystem is destroyed. Even if the container
-crashes before cleanup, the next invocation starts fresh.
+Mitigation (prompt mode): The entrypoint explicitly deletes `.credentials.json` before
+exiting. The `--rm` flag destroys the container filesystem.
+Mitigation (interactive mode): Credentials persist in the container for its lifetime.
+The container must be explicitly stopped. Use `--attach` to manage container lifecycle.
 
 **Threat: Credential interception during pipe transfer.**
 Mitigation: Unix pipes are kernel-level constructs. Data flows directly between process
-file descriptors without hitting disk. The pipe is not accessible to other processes on
-the system (only the parent and child process have the file descriptors).
+file descriptors without hitting disk.
 
 **Threat: Docker `--privileged` escalation.**
 Accepted risk: `--privileged` grants the container full kernel capabilities. This is
 required for DinD (dockerd needs to create cgroups, mount filesystems, etc.). The
-container is ephemeral and isolated. If this is unacceptable for your threat model,
-consider using Docker socket mounting instead of true DinD, which trades container
-isolation for reduced privilege requirements.
+container is isolated. If this is unacceptable for your threat model, consider using
+Docker socket mounting instead of true DinD.
 
 **Threat: Concurrent token use triggers rate limiting or revocation.**
 Observation: OAuth tokens are bearer tokens with no device binding. Using the same tokens
 on the host and in a container simultaneously works, but may trigger rate limiting if
-both are making API calls. The `rateLimitTier` field controls the bucket.
+both are making API calls. Multiple interactive sessions share a single token inside the
+container, which is indistinguishable from a single session from the server's perspective.
+
+**Threat: Interactive mode credentials outlive the session.**
+Mitigation: Credentials persist in the container's filesystem for its entire lifetime
+(unlike prompt mode where they are deleted after use). This is a conscious tradeoff for
+usability. When the container is stopped (`docker rm -f`), all data is destroyed.
 
 ---
 
@@ -607,6 +843,10 @@ both are making API calls. The `rateLimitTier` field controls the bucket.
 - Docker Desktop or OrbStack running
 - Claude Code installed and logged in on the host (`claude` should work in your terminal)
 - Rust toolchain (`cargo`)
+- shadow-terminal cloned into `extern/shadow-terminal/` (for interactive mode):
+  ```bash
+  git clone https://github.com/nichochar/shadow-terminal extern/shadow-terminal
+  ```
 
 ### Building
 
@@ -616,39 +856,83 @@ cd /path/to/claude-dind
 # Build the Rust CLI
 cargo build --release
 
-# Build the Docker image
-./target/release/claude-dind --build "test prompt"
+# Build the Docker image (required on first run or after Dockerfile changes)
+./target/release/claude-dind prompt --build "test prompt"
 # Or manually:
 docker build -t claude-dind:latest docker/
 ```
 
-### Running
+### Prompt Mode Usage
+
+Run a single prompt in an ephemeral container:
 
 ```bash
-# Basic usage: run a prompt
-./target/release/claude-dind "List the files in the current directory"
+# Basic usage
+claude-dind prompt "List the files in the current directory"
+
+# Build the Docker image first, then run
+claude-dind prompt --build "Write a Python hello world script"
 
 # With extra Claude flags
-./target/release/claude-dind --claude-flags "--output-format stream-json" "Write hello world in Python"
+claude-dind prompt --claude-flags "--output-format stream-json" "Write hello world in Python"
 
 # Keep the container after exit (for debugging)
-./target/release/claude-dind --keep "Describe the Docker environment"
+claude-dind prompt --keep "Describe the Docker environment"
 
-# Debug: print extracted credentials
-./target/release/claude-dind --dump-creds "ignored"
+# Debug: print extracted credentials and exit
+claude-dind prompt --dump-creds "ignored"
 
 # Verbose: show Docker command being run
-./target/release/claude-dind -v "Hello"
+claude-dind prompt -v "Hello"
 
 # Use a different image tag
-./target/release/claude-dind --image my-custom-claude:v2 "Hello"
+claude-dind prompt --image my-custom-claude:v2 "Hello"
 ```
+
+### Interactive Mode Usage
+
+Launch a terminal multiplexer with multiple Claude Code sessions:
+
+```bash
+# Start interactive mode (build image first if needed)
+claude-dind interactive --build
+
+# Start interactive mode (image already built)
+claude-dind interactive
+
+# Re-attach to a running container
+claude-dind interactive --attach abc123def456
+
+# Verbose mode
+claude-dind interactive -v
+```
+
+**Note:** Interactive mode must be run from a real terminal (Terminal.app, iTerm2, etc.),
+not from within another TUI or a non-TTY environment.
+
+### Keybindings
+
+All keybindings use a **Ctrl-b prefix** (like tmux). Press `Ctrl-b`, release, then
+press the command key.
+
+| Key | Action |
+|-----|--------|
+| `Ctrl-b c` | Create a new Claude session |
+| `Ctrl-b n` | Switch to the next session |
+| `Ctrl-b p` | Switch to the previous session |
+| `Ctrl-b 0`-`9` | Jump to session by index |
+| `Ctrl-b x` | Kill the current session |
+| `Ctrl-b d` | Detach (exit TUI, container keeps running) |
+| `Ctrl-b ?` | Toggle help overlay |
+| `Ctrl-b Ctrl-b` | Send a literal Ctrl-b to the active session |
+
+All other input is forwarded directly to the active session.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
+| 0 | Success (prompt completed, or interactive mode exited normally) |
 | 1 | General error (Docker, credential, or runtime failure) |
 | 2 | Credential validation error (missing, empty, or malformed) |
 | 3 | dockerd failed to start within timeout |
@@ -668,18 +952,41 @@ docker build -t claude-dind:latest docker/
   entrypoint is working.
 
 **"claude: command not found" inside container**
-- The non-root user's PATH may not include `/usr/local/bin`. The entrypoint exports PATH
-  explicitly to fix this. If you've modified the entrypoint, ensure the PATH export is
-  present.
+- The non-root user's PATH may not include `/usr/local/bin`. The entrypoint and session
+  commands export PATH explicitly to fix this. If you've modified either, ensure the
+  PATH export is present.
 
 **"dockerd failed to start within 30s"**
 - Ensure your Docker runtime supports `--privileged` containers. OrbStack and Docker
   Desktop both support this. Some cloud container runtimes (ECS, Cloud Run) do not.
+- If you changed the entrypoint, rebuild the image with `--build`.
 
 **Verbose dockerd output in stderr**
-- The DinD Docker daemon logs to stderr. This is normal. The Claude Code output will
-  appear interspersed with dockerd log lines. A future enhancement could redirect dockerd
-  logs to a file inside the container.
+- The DinD Docker daemon logs to stderr. This is normal in prompt mode. The Claude Code
+  output will appear interspersed with dockerd log lines. In interactive mode, dockerd
+  output is not visible since the TUI owns the terminal.
+
+**Sessions die immediately in interactive mode**
+- Check `/tmp/claude-dind-mux.log` for debug output. Look for "task finished" messages
+  shortly after "session created".
+- Ensure the container is running: `docker ps` should show the container.
+- Verify docker exec works manually:
+  `docker exec -it <container-id> su -l claude -c 'echo hello'`
+- Ensure you are running from a real terminal, not from within another program that
+  doesn't provide a proper TTY.
+
+**"Device not configured (os error 6)"**
+- This means the program is not connected to a real TTY. Run `claude-dind interactive`
+  from Terminal.app or iTerm2, not from within a tool that doesn't provide a terminal.
+
+**"Failed to send input: channel closed"**
+- The session's docker exec process has exited. This is logged but not fatal. Check
+  the log file for the underlying cause.
+
+**TUI renders but terminal content is blank**
+- shadow-terminal may not have received output yet. Wait a few seconds for Claude Code
+  to start. Check if `docker exec -it <id> claude --dangerously-skip-permissions`
+  works manually.
 
 ---
 
@@ -689,24 +996,32 @@ docker build -t claude-dind:latest docker/
    Keychain. Adding Linux support (reading `~/.claude/.credentials.json`) would require
    detecting the OS and choosing the appropriate extraction method.
 
-2. **No interactive mode.** The container runs `claude -p` (print mode), which executes
-   a single prompt and exits. An interactive mode would require passing through a TTY,
-   which conflicts with the stdin credential pipe.
+2. **dockerd noise in prompt mode.** The Docker daemon's logs go to stderr and mix with
+   Claude's output. Redirecting dockerd to a log file inside the container would clean
+   up the output.
 
-3. **dockerd noise.** The Docker daemon's logs go to stderr and mix with Claude's output.
-   Redirecting dockerd to a log file inside the container would clean up the output.
-
-4. **No token refresh persistence.** If Claude Code refreshes the access token inside the
+3. **No token refresh persistence.** If Claude Code refreshes the access token inside the
    container, the new token is written to `.credentials.json` inside the container -- but
-   the container is destroyed on exit. The host Keychain still has the old (possibly
-   expired) access token. This is fine because the refresh token is long-lived and Claude
-   Code on the host will refresh independently.
+   in prompt mode, the container is destroyed on exit. The host Keychain still has the old
+   (possibly expired) access token. This is fine because the refresh token is long-lived
+   and Claude Code on the host will refresh independently. In interactive mode, refreshed
+   tokens persist for the container's lifetime.
 
-5. **Single-prompt limitation.** Each invocation starts a new container, starts dockerd,
-   and runs one prompt. For multiple prompts, a persistent container with a command queue
-   would be more efficient.
-
-6. **Image size.** The `claude-dind:latest` image includes the full Docker daemon,
+4. **Image size.** The `claude-dind:latest` image includes the full Docker daemon,
    Node.js, and Claude Code. It's roughly 400-500MB. A slimmer variant without DinD
    (just Node.js + Claude Code) could be offered for use cases that don't need Docker
    inside the container.
+
+5. **Detach/reattach loses sessions.** When you detach from interactive mode and
+   reattach, existing Claude sessions inside the container may still be running, but
+   the multiplexer creates new shadow-terminal instances that don't reconnect to them.
+   True session persistence would require a screen/tmux-like attach mechanism inside
+   the container.
+
+6. **shadow-terminal dependency.** shadow-terminal must be cloned separately into
+   `extern/shadow-terminal/`. It is not published on crates.io. The `raw_string_direct_to_terminal`
+   function in shadow-terminal is patched to a no-op to prevent it from writing escape
+   codes directly to stdout while ratatui owns the terminal.
+
+7. **Single-host only.** Both modes require Docker to be running on the same machine.
+   Remote Docker host support (via `DOCKER_HOST`) is not tested.

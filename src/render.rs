@@ -1,3 +1,34 @@
+//! Rendering for the interactive terminal multiplexer.
+//!
+//! This module bridges two terminal abstraction layers:
+//!
+//! 1. **termwiz** (from shadow-terminal) — provides the virtual terminal state
+//!    as a [`Surface`]: a 2D grid of cells, each with a character, foreground
+//!    color, background color, and text attributes (bold, italic, underline, etc.).
+//!
+//! 2. **ratatui** — the TUI framework that renders to the real host terminal.
+//!    It has its own cell buffer, color types, and style system.
+//!
+//! The [`TerminalWidget`] bridges these by iterating through the termwiz
+//! `Surface` and writing each cell into the ratatui `Buffer`, converting
+//! colors and attributes along the way.
+//!
+//! ## Layout
+//!
+//! ```text
+//! ┌──────────────────────────────────────┐
+//! │                                      │  ← Terminal area (TerminalWidget)
+//! │  Active session's terminal output    │     Fills all available space
+//! │  (rendered from termwiz Surface)     │
+//! │                                      │
+//! │                                      │
+//! ├──────────────────────────────────────┤
+//! │ [0:claude-1*] [1:claude-2]  Ctrl-b ? │  ← Status bar (1 line)
+//! └──────────────────────────────────────┘
+//! ```
+//!
+//! An optional help overlay can be displayed centered on screen.
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,7 +41,12 @@ use termwiz::surface::Surface;
 
 use crate::session::SessionManager;
 
-/// Render the complete multiplexer frame: terminal buffer + status bar.
+/// Render the complete multiplexer frame: terminal area + status bar + optional help.
+///
+/// This is called on every frame (~60fps). The layout is:
+/// - Terminal area: fills all available space, renders the active session's screen
+/// - Status bar: fixed 1-line height at the bottom
+/// - Help overlay: centered panel, rendered on top of everything when `show_help` is true
 pub fn render_frame(frame: &mut Frame, sessions: &SessionManager, show_help: bool) {
     let chunks = Layout::vertical([
         Constraint::Min(1),    // Terminal area
@@ -158,10 +194,22 @@ fn render_help_overlay(frame: &mut Frame) {
     frame.render_widget(paragraph, overlay);
 }
 
-/// A ratatui widget that renders a termwiz Surface.
+/// A ratatui widget that renders a termwiz [`Surface`] into the host terminal.
 ///
-/// Maps each cell in the termwiz Surface grid to a ratatui buffer cell,
-/// converting colors and attributes.
+/// This is the core rendering bridge between shadow-terminal and ratatui.
+/// It iterates through the termwiz Surface's cell grid using:
+///
+/// 1. `surface.screen_lines()` — returns `Vec<Cow<Line>>` (rows of the terminal)
+/// 2. `line.cells()` — returns `&[Cell]` (individual cells in a row)
+/// 3. `cell.str()` — the character(s) in this cell
+/// 4. `cell.attrs()` — the cell's visual attributes (colors, bold, etc.)
+///
+/// Each termwiz cell is mapped to the corresponding ratatui buffer cell with
+/// converted colors and style modifiers. Cells beyond the widget's bounds are
+/// skipped.
+///
+/// Note: termwiz's `Surface` does not have a `get_cell(x, y)` method — you
+/// must iterate through `screen_lines()` and `cells()` sequentially.
 struct TerminalWidget<'a> {
     surface: &'a Surface,
 }
@@ -194,7 +242,16 @@ impl Widget for TerminalWidget<'_> {
     }
 }
 
-/// Convert a termwiz ColorAttribute to a ratatui Color.
+/// Convert a termwiz [`ColorAttribute`] to a ratatui [`Color`].
+///
+/// termwiz uses `ColorAttribute` (not `ColorSpec`) for foreground/background:
+/// - `Default` — use the terminal's default color (returns `None`)
+/// - `PaletteIndex(u8)` — a 256-color palette index (mapped to `Color::Indexed`)
+/// - `TrueColorWithDefaultFallback(SrgbaTuple)` — 24-bit RGB, falls back to default
+/// - `TrueColorWithPaletteFallback(SrgbaTuple, u8)` — 24-bit RGB, falls back to palette
+///
+/// `SrgbaTuple` stores RGBA as `(f32, f32, f32, f32)` in [0.0, 1.0] range.
+/// We use `.as_rgba_u8()` to convert to `(u8, u8, u8, u8)` for ratatui.
 fn termwiz_color_to_ratatui(color: ColorAttribute) -> Option<Color> {
     match color {
         ColorAttribute::Default => None,
@@ -210,7 +267,17 @@ fn termwiz_color_to_ratatui(color: ColorAttribute) -> Option<Color> {
     }
 }
 
-/// Convert termwiz CellAttributes to a ratatui Style.
+/// Convert termwiz [`CellAttributes`] to a ratatui [`Style`].
+///
+/// Maps the following attributes:
+/// - **Intensity**: `Bold` → `Modifier::BOLD`, `Half` → `Modifier::DIM`
+///   (Note: termwiz uses `intensity()` returning an `Intensity` enum,
+///   not a `bold()` boolean method.)
+/// - **Italic**: `italic()` → `Modifier::ITALIC`
+/// - **Underline**: `underline() != Underline::None` → `Modifier::UNDERLINED`
+/// - **Strikethrough**: `strikethrough()` → `Modifier::CROSSED_OUT`
+/// - **Reverse**: `reverse()` → `Modifier::REVERSED` (swaps fg/bg)
+/// - **Foreground/Background**: via [`termwiz_color_to_ratatui`]
 fn termwiz_attrs_to_ratatui_style(attrs: &CellAttributes) -> Style {
     let mut style = Style::default();
 

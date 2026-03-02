@@ -1,3 +1,35 @@
+//! Session management for the interactive terminal multiplexer.
+//!
+//! Each Claude Code session runs as a `docker exec -it <container> ...` process
+//! inside the long-lived DinD container. The process is wrapped in a
+//! shadow-terminal [`ActiveTerminal`] which provides:
+//!
+//! - A real PTY (via portable-pty) so `docker exec -it` detects a terminal
+//! - Full ANSI/VT100 terminal emulation (via wezterm-term) into a cell grid
+//! - Async channels for sending keystrokes and receiving rendered screen state
+//!
+//! The rendered screen state is a termwiz [`Surface`] — a 2D grid of cells,
+//! each with a character, foreground/background color, and text attributes.
+//! This `Surface` is what [`crate::render::TerminalWidget`] maps to ratatui
+//! buffer cells for display.
+//!
+//! ## Double-PTY Pattern
+//!
+//! Sessions use a double-PTY arrangement:
+//!
+//! ```text
+//! portable-pty (host) → bash -c "docker exec -it ... claude"
+//!                                      ↓
+//!                              docker allocates inner PTY
+//!                                      ↓
+//!                              claude runs with full TUI
+//! ```
+//!
+//! The outer PTY (portable-pty) satisfies docker's `isatty()` check on stdin.
+//! The inner PTY (allocated by docker exec `-t`) gives Claude Code a real
+//! terminal to render its TUI into. This is analogous to running tmux inside
+//! an ssh session.
+
 use anyhow::{bail, Result};
 use shadow_terminal::active_terminal::ActiveTerminal;
 use shadow_terminal::output::native::{CompleteSurface, Output};
@@ -5,26 +37,44 @@ use shadow_terminal::shadow_terminal::Config;
 use std::ffi::OsString;
 use termwiz::surface::Surface;
 
-/// Metadata about a single Claude session running inside the container.
+/// Metadata about a single Claude Code session running inside the container.
+///
+/// Each session owns an [`ActiveTerminal`] that manages the underlying PTY
+/// process and provides async I/O channels. The `screen` field holds the
+/// latest terminal state as a termwiz [`Surface`], updated by [`SessionManager::poll_output`].
 pub struct Session {
-    /// The shadow-terminal ActiveTerminal wrapping the docker exec process.
+    /// The shadow-terminal `ActiveTerminal` wrapping the docker exec process.
+    /// Provides `send_input()` for keystrokes and `surface_output_rx` for
+    /// receiving rendered terminal state.
     pub terminal: ActiveTerminal,
-    /// Human-readable name for the session.
+    /// Human-readable name for the session (e.g., "claude-1", "claude-2").
     pub name: String,
-    /// The latest complete screen surface from shadow-terminal.
+    /// The latest terminal screen state. Updated by `poll_output()` from
+    /// shadow-terminal's output channel. This is a termwiz `Surface` — a 2D
+    /// grid of cells with characters, colors, and attributes.
     pub screen: Surface,
-    /// Whether the session's underlying process has exited.
+    /// Whether the session's underlying docker exec process has exited.
+    /// Checked via `terminal.task_handle.is_finished()` in the event loop.
     pub exited: bool,
 }
 
-/// Manages multiple Claude sessions inside a single DinD container.
+/// Manages multiple Claude Code sessions inside a single DinD container.
 ///
 /// Each session is a `docker exec -it <container> su -l claude -c "claude ..."`
-/// process, wrapped in a shadow-terminal `ActiveTerminal` for virtual
+/// process, wrapped in a shadow-terminal [`ActiveTerminal`] for virtual
 /// terminal emulation.
+///
+/// The multiplexer maintains an `active` index pointing to the currently
+/// displayed session. Navigation methods (`next`, `prev`, `switch_to`) update
+/// this index; the renderer reads it to determine which session's screen to
+/// display.
 pub struct SessionManager {
+    /// All sessions, both active and exited. Exited sessions are cleaned up
+    /// by [`cleanup_exited`](Self::cleanup_exited).
     pub sessions: Vec<Session>,
+    /// Index of the currently active (displayed) session.
     pub active: usize,
+    /// Docker container ID. Used to construct `docker exec` commands.
     container_id: String,
 }
 
@@ -37,10 +87,20 @@ impl SessionManager {
         }
     }
 
-    /// Create a new Claude session inside the container.
+    /// Create a new Claude Code session inside the container.
     ///
     /// Spawns `docker exec -it <container> su -l claude -c "claude --dangerously-skip-permissions"`
-    /// wrapped in a shadow-terminal `ActiveTerminal`.
+    /// wrapped in a shadow-terminal [`ActiveTerminal`].
+    ///
+    /// The command is wrapped in `bash -c` to ensure proper TTY inheritance.
+    /// portable-pty allocates a PTY slave, and `bash` inherits it as its
+    /// controlling terminal. When bash then runs `docker exec -it`, docker's
+    /// `isatty()` check on stdin succeeds, so it allocates an inner PTY inside
+    /// the container for Claude Code.
+    ///
+    /// The `width` and `height` parameters set the initial terminal dimensions
+    /// for both the shadow-terminal virtual screen and the PTY. Height should
+    /// be the terminal height minus 1 (for the status bar).
     pub fn create(&mut self, width: u16, height: u16) -> Result<usize> {
         let idx = self.sessions.len();
         let name = format!("claude-{}", idx + 1);
@@ -85,9 +145,13 @@ impl SessionManager {
 
     /// Send raw bytes to a session's PTY input.
     ///
-    /// BytesFromSTDIN is `[u8; 128]`. For keyboard input we typically send
-    /// 1-4 bytes; the trailing zeros are harmless since the PTY only reads
-    /// as many bytes as were written.
+    /// shadow-terminal's `send_input()` accepts `BytesFromSTDIN`, a `[u8; 128]`
+    /// fixed-size buffer. The PTY reads bytes up to the first null (0x00) byte,
+    /// so trailing zeros are harmless. For keyboard input we typically send
+    /// 1-4 bytes (a single UTF-8 character or escape sequence).
+    ///
+    /// For inputs longer than 128 bytes (e.g., pasted text), the data is
+    /// chunked into 128-byte segments and sent sequentially.
     pub async fn send_input(&self, session_idx: usize, bytes: &[u8]) -> Result<()> {
         if session_idx >= self.sessions.len() {
             bail!("Invalid session index: {session_idx}");
@@ -113,8 +177,18 @@ impl SessionManager {
 
     /// Poll for output updates from a session's shadow-terminal.
     ///
-    /// Returns true if the screen was updated. Updates the session's
-    /// stored `screen` Surface with the latest data.
+    /// Drains all available messages from the session's `surface_output_rx`
+    /// channel (non-blocking). shadow-terminal sends two types of output:
+    ///
+    /// - **`Output::Complete`**: A full replacement of the terminal screen.
+    ///   Contains a complete [`Surface`] with all cells. Received after large
+    ///   changes or initial rendering.
+    ///
+    /// - **`Output::Diff`**: Incremental changes (a list of `Change` operations)
+    ///   applied to the existing surface. More efficient for small updates like
+    ///   cursor movement or single-line changes.
+    ///
+    /// Returns `true` if the screen was updated (caller should re-render).
     pub fn poll_output(&mut self, session_idx: usize) -> bool {
         if session_idx >= self.sessions.len() {
             return false;
