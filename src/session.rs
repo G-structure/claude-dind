@@ -1,7 +1,7 @@
 //! Session management for the interactive terminal multiplexer.
 //!
 //! Each Claude Code session runs as a `docker exec -it <container> ...` process
-//! inside the long-lived DinD container. The process is wrapped in a
+//! inside the long-lived container. The process is wrapped in a
 //! shadow-terminal [`ActiveTerminal`] which provides:
 //!
 //! - A real PTY (via portable-pty) so `docker exec -it` detects a terminal
@@ -58,7 +58,7 @@ pub struct Session {
     pub exited: bool,
 }
 
-/// Manages multiple Claude Code sessions inside a single DinD container.
+/// Manages multiple Claude Code sessions inside a single container.
 ///
 /// Each session is a `docker exec -it <container> su -l claude -c "claude ..."`
 /// process, wrapped in a shadow-terminal [`ActiveTerminal`] for virtual

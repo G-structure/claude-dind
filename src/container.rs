@@ -1,15 +1,17 @@
-//! Long-lived Docker-in-Docker container management.
+//! Long-lived container management for Docker-out-of-Docker (DooD) mode.
 //!
-//! In interactive mode, a single DinD container stays alive while the
-//! multiplexer creates/kills individual Claude Code sessions inside it via
-//! `docker exec`. This module manages that container's lifecycle:
+//! In interactive mode, a single container stays alive while the multiplexer
+//! creates/kills individual Claude Code sessions inside it via `docker exec`.
+//! The host's Docker socket is bind-mounted so Claude can run Docker commands
+//! as sibling containers on the host daemon. This module manages the container
+//! lifecycle:
 //!
-//! - **Start**: `docker run -d --privileged --env CLAUDE_MODE=interactive`
+//! - **Start**: `docker run -d` with socket mount, security opts, and
+//!   `CLAUDE_MODE=interactive`
 //! - **Credential injection**: Writes the credential JSON into the container's
 //!   filesystem via `docker exec -i` with stdin piping (avoids credentials
 //!   appearing in process arguments visible to `ps`/`docker inspect`)
-//! - **Health checks**: Polls `docker info` inside the container to wait for
-//!   the Docker daemon to be ready
+//! - **Health checks**: Verifies Docker socket access inside the container
 //! - **Attach**: Reconnects to an already-running container by ID
 //! - **Stop**: `docker rm -f` for cleanup
 //!
@@ -30,10 +32,10 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
-/// Manages a long-lived Docker-in-Docker container for interactive mode.
+/// Manages a long-lived Docker container for interactive mode.
 ///
 /// Instead of the ephemeral one-container-per-prompt model, interactive mode
-/// starts a single privileged DinD container that stays alive. Individual
+/// starts a single container with the host Docker socket mounted. Individual
 /// Claude sessions are spawned inside it via `docker exec`.
 pub struct ContainerManager {
     pub container_id: String,
@@ -42,21 +44,41 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
-    /// Start a long-lived DinD container in interactive mode.
+    /// Start a long-lived container in interactive mode.
     ///
     /// The container runs with `CLAUDE_MODE=interactive`, which tells the
-    /// entrypoint to start dockerd and then `sleep infinity` instead of
-    /// running a single Claude prompt.
+    /// entrypoint to match the Docker socket GID and then `sleep infinity`
+    /// instead of running a single Claude prompt.
+    ///
+    /// The host's Docker socket is bind-mounted so Claude can run Docker
+    /// commands. `--security-opt no-new-privileges` prevents privilege
+    /// escalation inside the container.
     ///
     /// Credentials are injected after the container starts via `inject_credentials`.
-    pub fn start(image: &str, verbose: bool) -> Result<Self> {
+    pub fn start(
+        image: &str,
+        verbose: bool,
+        workspace: Option<&str>,
+        docker_socket: &str,
+    ) -> Result<Self> {
         let mut args: Vec<String> = vec![
             "run".into(),
-            "-d".into(),           // Detached mode
-            "--privileged".into(), // Required for DinD
+            "-d".into(), // Detached mode
+            // Mount host Docker socket for DooD
+            "-v".into(),
+            format!("{docker_socket}:/var/run/docker.sock"),
+            // Prevent privilege escalation
+            "--security-opt".into(),
+            "no-new-privileges".into(),
             "--env".into(),
             "CLAUDE_MODE=interactive".into(),
         ];
+
+        // Optional workspace mount
+        if let Some(ws) = workspace {
+            args.push("-v".into());
+            args.push(format!("{ws}:/workspace"));
+        }
 
         args.push(image.into());
 
@@ -188,9 +210,13 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// Wait for the Docker daemon inside the container to be ready.
-    pub fn wait_for_dockerd(&self, timeout_secs: u32) -> Result<()> {
-        eprintln!("[claude-dind] Waiting for Docker daemon inside container...");
+    /// Wait for the container to be ready (Docker socket accessible).
+    ///
+    /// Polls `docker info` inside the container to verify the mounted Docker
+    /// socket is accessible. Warns instead of failing if Docker is not
+    /// available — Claude can still function without Docker access.
+    pub fn wait_for_ready(&self, timeout_secs: u32) -> Result<()> {
+        eprintln!("[claude-dind] Waiting for container to be ready...");
 
         for elapsed in 0..timeout_secs {
             let output = Command::new("docker")
@@ -201,17 +227,21 @@ impl ContainerManager {
                     "info",
                 ])
                 .output()
-                .context("Failed to check Docker daemon status")?;
+                .context("Failed to check Docker status inside container")?;
 
             if output.status.success() {
-                eprintln!("[claude-dind] Docker daemon ready (took {elapsed}s).");
+                eprintln!("[claude-dind] Container ready, Docker accessible (took {elapsed}s).");
                 return Ok(());
             }
 
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
-        bail!("Docker daemon failed to start within {timeout_secs}s");
+        eprintln!(
+            "[claude-dind] WARNING: Docker not accessible inside container after {timeout_secs}s. \
+             Docker commands may not work, but Claude sessions will still function."
+        );
+        Ok(())
     }
 
     /// Stop and remove the container.

@@ -1,4 +1,4 @@
-# claude-dind: Running Claude Code in Docker-in-Docker with Host Credentials
+# claude-dind: Running Claude Code in Docker with Host Credentials (Docker-out-of-Docker)
 
 ## Table of Contents
 
@@ -16,7 +16,7 @@
   - [Why Rust?](#why-rust)
   - [Why Shell Out to `security` Instead of Using a Crate?](#why-shell-out-to-security-instead-of-using-a-crate)
   - [Why stdin Piping Instead of Volume Mounts or Environment Variables?](#why-stdin-piping-instead-of-volume-mounts-or-environment-variables)
-  - [Why a Single DinD Image Instead of Nested Containers?](#why-a-single-dind-image-instead-of-nested-containers)
+  - [Why Docker-out-of-Docker Instead of Docker-in-Docker?](#why-docker-out-of-docker-instead-of-docker-in-docker)
   - [Why a Non-Root User Inside the Container?](#why-a-non-root-user-inside-the-container)
   - [Why --dangerously-skip-permissions?](#why---dangerously-skip-permissions)
   - [Why shadow-terminal?](#why-shadow-terminal)
@@ -255,32 +255,34 @@ claude-dind operates in two modes: **prompt** (ephemeral, one-shot) and **intera
  │  │  6. Stream output        │                        │
  │  └────────────┬─────────────┘                        │
  │               │                                      │
- │               │ docker run --privileged -i --rm       │
+ │               │ docker run -i --rm                    │
+ │               │ -v /var/run/docker.sock:...            │
+ │               │ --security-opt no-new-privileges       │
  │               │ --env CLAUDE_PROMPT="..."             │
  │               │                                      │
  └───────────────┼──────────────────────────────────────┘
                  │
     ┌────────────▼──────────────────────────────────────┐
     │  Docker Container (claude-dind:latest)             │
-    │  Base: docker:dind + nodejs + claude-code          │
+    │  Base: docker:cli + nodejs + claude-code           │
+    │  Mount: /var/run/docker.sock (host socket)         │
     │                                                    │
     │  entrypoint.sh (CLAUDE_MODE=prompt):               │
     │                                                    │
-    │  Phase 1: cat (stdin) -> $CREDS_JSON               │
+    │  Phase 1: Match docker group GID to socket GID     │
+    │           Verify Docker socket access               │
+    │                                                    │
+    │  Phase 2: cat (stdin) -> $CREDS_JSON               │
     │           Validate with jq                         │
     │                                                    │
-    │  Phase 2: Write to                                 │
+    │  Phase 3: Write to                                 │
     │           /home/claude/.claude/.credentials.json    │
     │           chmod 600                                │
-    │                                                    │
-    │  Phase 3: dockerd-entrypoint.sh dockerd &          │
-    │           Wait for docker info to succeed           │
     │                                                    │
     │  Phase 4: su -l claude -c "claude -p ..."          │
     │           (runs as non-root user)                  │
     │                                                    │
     │  Phase 5: rm .credentials.json                     │
-    │           kill dockerd                             │
     │           exit with claude's exit code             │
     │                                                    │
     └───────────────────────────────────────────────────┘
@@ -320,12 +322,10 @@ claude-dind operates in two modes: **prompt** (ephemeral, one-shot) and **intera
  └──────────────┼───────────────┼────────────────────────────┘
                 │               │
    ┌────────────▼───────────────▼───────────────────────┐
-   │  Long-lived DinD Container                         │
+   │  Long-lived Container (DooD)                        │
    │  (CLAUDE_MODE=interactive)                         │
    │                                                    │
-   │  ┌──────────┐                                      │
-   │  │ dockerd  │  (shared Docker daemon)              │
-   │  └──────────┘                                      │
+   │  /var/run/docker.sock (mounted from host)          │
    │                                                    │
    │  /home/claude/.claude/.credentials.json             │
    │  (injected via docker exec after startup)          │
@@ -342,13 +342,14 @@ The system has three components:
    the Keychain, manages Docker containers, and in interactive mode provides a terminal
    multiplexer TUI.
 
-2. **Docker image** (`claude-dind:latest`) -- A single image based on `docker:dind` with
-   Node.js and Claude Code installed. Provides both a Docker daemon (for DinD) and the
-   Claude Code CLI.
+2. **Docker image** (`claude-dind:latest`) -- A single image based on `docker:cli` with
+   Node.js and Claude Code installed. The host Docker socket is bind-mounted for Docker
+   access (Docker-out-of-Docker).
 
-3. **Entrypoint script** -- Orchestrates the container startup. In prompt mode: reads
-   credentials from stdin, starts dockerd, runs Claude, cleans up. In interactive mode:
-   starts dockerd, then sleeps forever (sessions created via `docker exec`).
+3. **Entrypoint script** -- Orchestrates the container startup. In prompt mode: matches
+   the Docker socket GID, reads credentials from stdin, runs Claude, cleans up. In
+   interactive mode: matches the socket GID, then sleeps forever (sessions created via
+   `docker exec`).
 
 ---
 
@@ -358,13 +359,13 @@ The system has three components:
 src/
 ├── main.rs            CLI entry point (clap subcommands: prompt, interactive)
 ├── credentials.rs     macOS Keychain extraction via `security` CLI
-├── container.rs       ContainerManager: start/stop/attach long-lived DinD containers
+├── container.rs       ContainerManager: start/stop/attach long-lived containers (DooD)
 ├── session.rs         SessionManager: shadow-terminal ActiveTerminal + docker exec
 ├── multiplexer.rs     TUI event loop, Ctrl-b prefix keybindings, input dispatch
 └── render.rs          ratatui rendering: TerminalWidget, status bar, help overlay
 
 docker/
-├── Dockerfile         docker:dind + Node.js + Claude Code + non-root user
+├── Dockerfile         docker:cli + Node.js + Claude Code + non-root user
 └── entrypoint.sh      Container startup (prompt mode and interactive mode)
 
 extern/
@@ -450,31 +451,33 @@ stdin, then close the pipe.
 /home/claude/.claude/.credentials.json'` with the JSON piped to the exec's stdin. This
 avoids credentials appearing in process arguments.
 
-### Why a Single DinD Image Instead of Nested Containers?
+### Why Docker-out-of-Docker Instead of Docker-in-Docker?
 
-We evaluated three architectures:
+We evaluated three Docker architectures:
 
-**Option A: True nesting** (outer DinD container starts an inner Claude Code container).
-- Requires piping credentials through two container layers.
-- Race conditions with dockerd startup inside the outer container.
-- Two Dockerfiles to maintain.
-- More complex debugging.
+**Option A: True DinD** (`docker:dind` base, `--privileged`, nested daemon).
+- Requires `--privileged`, granting full kernel capabilities.
+- Heavy: starts a full Docker daemon (containerd + dockerd) inside the container.
+- Slow startup: must wait for the nested daemon to be ready (2-5s typical).
+- Stronger isolation: containers created by Claude are truly nested.
 
-**Option B: Single custom DinD image (chosen).**
-- One image based on `docker:dind` that also has Node.js and Claude Code.
-- Claude Code runs directly in the DinD container alongside the Docker daemon.
-- stdin piping is trivial -- only one layer.
-- One Dockerfile, one entrypoint.
+**Option B: Docker-out-of-Docker (chosen).**
+- One image based on `docker:cli` with Node.js and Claude Code.
+- Host Docker socket is bind-mounted into the container.
+- No `--privileged` — uses `--security-opt no-new-privileges` instead.
+- Lighter weight and faster: no nested daemon, instant Docker access.
+- Trade-off: containers created by Claude run as siblings on the host daemon.
 
-**Option C: DinD outer with baked-in inner image.**
-- The outer image contains the inner image via `docker save`/`docker load`.
-- Extremely large outer image.
-- Complex build pipeline.
+**Option C: No Docker access.**
+- Simplest, but Claude cannot build/run containers as part of its work.
+- Too limiting for agent workflows that involve Docker commands.
 
-Option B wins on simplicity. The "Docker-in-Docker" aspect still works: the container
-runs a real Docker daemon, so if Claude Code's prompt involves building or running Docker
-containers (common in agent workflows), it has a working `docker` command available.
-The DinD is for Claude's use, not for isolating Claude from itself.
+Option B wins on the balance of security and capability. The `--privileged` flag in
+Option A grants the container full kernel capabilities — a significant attack surface.
+DooD removes this requirement while still giving Claude a working `docker` command.
+The trade-off is that Claude's Docker commands execute on the host daemon, creating
+sibling containers rather than nested ones. This is mitigated by `--security-opt
+no-new-privileges` and running Claude as a non-root user.
 
 ### Why a Non-Root User Inside the Container?
 
@@ -487,7 +490,7 @@ run with `--dangerously-skip-permissions` when the effective user is root:
 
 This is a safety check in Claude Code itself. The solution is to create a dedicated
 `claude` user inside the container and run the `claude` process via `su -l claude`. The
-entrypoint still runs as root (needed for starting `dockerd`), but drops to the `claude`
+entrypoint still runs as root (needed for matching the Docker socket GID), but drops to the `claude`
 user for the actual Claude Code execution.
 
 The `claude` user has:
@@ -506,7 +509,7 @@ This is acceptable because:
 1. The container is ephemeral (`--rm` deletes it after exit) or isolated (interactive mode).
 2. The container is isolated from the host filesystem.
 3. The user explicitly chose to run this command and provided the prompt.
-4. The DinD environment means even Docker operations are contained.
+4. Docker operations via the mounted socket create sibling containers, not nested ones.
 
 ### Why shadow-terminal?
 
@@ -540,8 +543,8 @@ a single container that stays alive:
 
 1. **Avoids re-injecting credentials** for every new session. Credentials are injected
    once after startup.
-2. **Avoids restarting dockerd** every time. The Docker daemon starts once and serves all
-   sessions.
+2. **Avoids repeating socket GID matching** every time. The socket permissions are set
+   up once at container startup.
 3. **Enables detach/reattach.** The user can `Ctrl-b d` to detach from the TUI while the
    container continues running. `claude-dind interactive --attach <id>` reconnects.
 4. **Shared filesystem.** Multiple Claude sessions can read/write the same `/workspace`,
@@ -561,17 +564,18 @@ JSON string.
 
 ### Container Management (`src/container.rs`)
 
-`ContainerManager` wraps a long-lived DinD container. Key methods:
+`ContainerManager` wraps a long-lived container with the host Docker socket mounted. Key methods:
 
-- **`start(image, verbose)`** -- `docker run -d --privileged --env CLAUDE_MODE=interactive`
-  to create a detached container. Returns the container ID.
+- **`start(image, verbose, workspace, docker_socket)`** -- `docker run -d` with socket
+  mount, `--security-opt no-new-privileges`, and `CLAUDE_MODE=interactive`. Returns the
+  container ID. Optionally mounts a host workspace directory.
 - **`attach(container_id)`** -- Connects to an already-running container. Verifies it is
   still running via `docker inspect`.
 - **`inject_credentials(creds_json)`** -- Writes the credential JSON into the container
   via `docker exec -i <id> sh -c 'cat > /home/claude/.claude/.credentials.json'`. The
   JSON is piped through stdin to avoid appearing in process arguments.
-- **`wait_for_dockerd(timeout)`** -- Polls `docker exec <id> docker info` until the
-  daemon is ready (or timeout).
+- **`wait_for_ready(timeout)`** -- Polls `docker exec <id> docker info` to verify the
+  Docker socket is accessible. Warns instead of failing if Docker is not available.
 - **`stop()`** -- `docker rm -f <id>`.
 - **`is_running()`** -- `docker inspect --format {{.State.Running}}`.
 - **`short_id()`** -- First 12 characters of the container ID for display.
@@ -659,22 +663,24 @@ session creation, output events (first 50 frames), task completion, and input er
 Two clap subcommands:
 
 **`claude-dind prompt <prompt> [options]`** -- Original ephemeral mode.
-- Extracts credentials, spawns `docker run --privileged -i --rm`, pipes credentials via
-  stdin, streams output. Options: `--build`, `--image`, `--docker-context`,
-  `--claude-flags`, `--keep`, `--dump-creds`, `-v`.
+- Extracts credentials, spawns `docker run -i --rm` with socket mount and security opts,
+  pipes credentials via stdin, streams output. Options: `--build`, `--image`,
+  `--docker-context`, `-w`/`--workspace`, `--docker-socket`, `--claude-flags`, `--keep`,
+  `--dump-creds`, `-v`.
 
 **`claude-dind interactive [options]`** -- Multiplexer mode.
 - Starts (or attaches to) a long-lived container. Injects credentials. Creates a tokio
   runtime and runs the multiplexer TUI. On detach, prints the container ID for
   reattachment. On normal exit (all sessions ended), stops the container. Options:
-  `--build`, `--image`, `--docker-context`, `--attach <id>`, `-v`.
+  `--build`, `--image`, `--docker-context`, `-w`/`--workspace`, `--docker-socket`,
+  `--attach <id>`, `-v`.
 
 Helper functions: `resolve_docker_context()` (finds the `docker/` directory),
 `build_image()` (runs `docker build`), `run_container()` (prompt mode Docker lifecycle).
 
 ### The Dockerfile (`docker/Dockerfile`)
 
-Built on `docker:dind` (Alpine Linux with Docker daemon and CLI).
+Built on `docker:cli` (Alpine Linux with Docker CLI only — no daemon).
 
 Layer by layer:
 
@@ -697,20 +703,21 @@ Layer by layer:
 
 Supports two modes via `$CLAUDE_MODE`:
 
-**Both modes** start dockerd first:
-- Runs `dockerd-entrypoint.sh dockerd &` in the background.
-- Polls `docker info` until ready (up to 30s timeout).
+**Both modes** start by matching the Docker socket GID:
+- Detects the mounted socket's GID via `stat`.
+- Adjusts the container's `docker` group GID with `groupmod` to match.
+- Verifies socket access with `docker info` (warns if unavailable).
 
 **Interactive mode** (`CLAUDE_MODE=interactive`):
-- After dockerd is ready, traps SIGTERM/SIGINT for graceful shutdown.
+- After GID matching, traps SIGTERM/SIGINT for graceful shutdown.
 - Enters a `while true; do sleep 86400 & wait; done` loop.
 - Sessions and credentials are managed externally via `docker exec`.
 
 **Prompt mode** (`CLAUDE_MODE=prompt`, the default):
-- Phase 1: Reads credential JSON from stdin via `cat`. Validates with `jq`.
-- Phase 2: Writes to `/home/claude/.claude/.credentials.json` with `chmod 600`.
+- Phase 2: Reads credential JSON from stdin via `cat`. Validates with `jq`.
+- Phase 3: Writes to `/home/claude/.claude/.credentials.json` with `chmod 600`.
 - Phase 4: Runs `su -l claude -c "claude -p <prompt> --dangerously-skip-permissions"`.
-- Phase 5: Deletes credentials, kills dockerd, exits with Claude's exit code.
+- Phase 5: Deletes credentials, exits with Claude's exit code.
 
 ---
 
@@ -727,14 +734,14 @@ Step 2:  Rust CLI validates JSON
          serde_json::from_str() -> check .claudeAiOauth.accessToken exists
 
 Step 3:  Rust CLI spawns Docker child process
-         docker run --privileged -i --rm --env CLAUDE_PROMPT="..." claude-dind:latest
+         docker run -i --rm -v /var/run/docker.sock:... --env CLAUDE_PROMPT="..." claude-dind:latest
 
 Step 4:  Rust CLI writes credentials to child's stdin pipe
          child.stdin.write_all(json_bytes)
 
 Step 5:  Rust CLI drops stdin handle -> EOF sent to container
 
-Step 6:  Container entrypoint starts dockerd, waits for readiness
+Step 6:  Container entrypoint matches Docker socket GID, verifies access
 
 Step 7:  Container entrypoint reads stdin (gets full JSON)
 
@@ -748,7 +755,7 @@ Step 11: Claude Code executes the prompt, output streams to container stdout
 
 Step 12: Container stdout inherited by Rust CLI -> streams to user's terminal
 
-Step 13: Claude Code exits -> entrypoint deletes .credentials.json -> kills dockerd
+Step 13: Claude Code exits -> entrypoint deletes .credentials.json
 
 Step 14: Container exits -> Docker removes it (--rm) -> all traces gone
 
@@ -761,12 +768,12 @@ Step 15: Rust CLI forwards container's exit code as its own
 Step 1:  Rust CLI reads macOS Keychain (same as prompt mode)
 
 Step 2:  Rust CLI starts detached container
-         docker run -d --privileged --env CLAUDE_MODE=interactive claude-dind:latest
+         docker run -d -v /var/run/docker.sock:... --env CLAUDE_MODE=interactive claude-dind:latest
 
-Step 3:  Container entrypoint starts dockerd, waits for readiness,
+Step 3:  Container entrypoint matches Docker socket GID,
          then enters infinite sleep loop
 
-Step 4:  Rust CLI waits for dockerd inside container (polls docker exec <id> docker info)
+Step 4:  Rust CLI waits for container to be ready (polls docker exec <id> docker info)
 
 Step 5:  Rust CLI injects credentials via docker exec
          echo $JSON | docker exec -i <id> sh -c 'cat > ~/.claude/.credentials.json'
@@ -816,11 +823,11 @@ The container must be explicitly stopped. Use `--attach` to manage container lif
 Mitigation: Unix pipes are kernel-level constructs. Data flows directly between process
 file descriptors without hitting disk.
 
-**Threat: Docker `--privileged` escalation.**
-Accepted risk: `--privileged` grants the container full kernel capabilities. This is
-required for DinD (dockerd needs to create cgroups, mount filesystems, etc.). The
-container is isolated. If this is unacceptable for your threat model, consider using
-Docker socket mounting instead of true DinD.
+**Threat: Docker socket access (host daemon exposure).**
+Accepted risk: Mounting the host Docker socket gives the container access to the host
+Docker daemon. Claude can create/inspect/remove sibling containers. This is mitigated by:
+`--security-opt no-new-privileges` (prevents privilege escalation), running Claude as a
+non-root user, and removing the `--privileged` flag entirely (no extra kernel capabilities).
 
 **Threat: Concurrent token use triggers rate limiting or revocation.**
 Observation: OAuth tokens are bearer tokens with no device binding. Using the same tokens
@@ -887,6 +894,12 @@ claude-dind prompt -v "Hello"
 
 # Use a different image tag
 claude-dind prompt --image my-custom-claude:v2 "Hello"
+
+# Mount a host directory as the workspace
+claude-dind prompt -w ./my-project "Describe the project structure"
+
+# Use a non-standard Docker socket (e.g., OrbStack, Colima)
+claude-dind prompt --docker-socket ~/.orbstack/run/docker.sock "Hello"
 ```
 
 ### Interactive Mode Usage
@@ -896,6 +909,9 @@ Launch a terminal multiplexer with multiple Claude Code sessions:
 ```bash
 # Start interactive mode (build image first if needed)
 claude-dind interactive --build
+
+# Mount a host directory as the workspace
+claude-dind interactive --build -w ./my-project
 
 # Start interactive mode (image already built)
 claude-dind interactive
@@ -935,7 +951,7 @@ All other input is forwarded directly to the active session.
 | 0 | Success (prompt completed, or interactive mode exited normally) |
 | 1 | General error (Docker, credential, or runtime failure) |
 | 2 | Credential validation error (missing, empty, or malformed) |
-| 3 | dockerd failed to start within timeout |
+| 3 | Reserved (previously: dockerd timeout; no longer used) |
 | Other | Forwarded from Claude Code's own exit code |
 
 ---
@@ -956,15 +972,15 @@ All other input is forwarded directly to the active session.
   commands export PATH explicitly to fix this. If you've modified either, ensure the
   PATH export is present.
 
-**"dockerd failed to start within 30s"**
-- Ensure your Docker runtime supports `--privileged` containers. OrbStack and Docker
-  Desktop both support this. Some cloud container runtimes (ECS, Cloud Run) do not.
-- If you changed the entrypoint, rebuild the image with `--build`.
+**"Docker socket mounted but not accessible"**
+- The host Docker socket GID may not match the container's docker group. The entrypoint
+  attempts to fix this automatically with `groupmod`. If it still fails, check the
+  socket permissions on the host: `ls -la /var/run/docker.sock`.
+- If using a non-standard Docker socket (OrbStack, Colima), use the `--docker-socket` flag.
 
-**Verbose dockerd output in stderr**
-- The DinD Docker daemon logs to stderr. This is normal in prompt mode. The Claude Code
-  output will appear interspersed with dockerd log lines. In interactive mode, dockerd
-  output is not visible since the TUI owns the terminal.
+**"No Docker socket found"**
+- Ensure Docker is running on the host and the socket exists at `/var/run/docker.sock`
+  (or use `--docker-socket` for non-standard paths).
 
 **Sessions die immediately in interactive mode**
 - Check `/tmp/claude-dind-mux.log` for debug output. Look for "task finished" messages
@@ -996,9 +1012,11 @@ All other input is forwarded directly to the active session.
    Keychain. Adding Linux support (reading `~/.claude/.credentials.json`) would require
    detecting the OS and choosing the appropriate extraction method.
 
-2. **dockerd noise in prompt mode.** The Docker daemon's logs go to stderr and mix with
-   Claude's output. Redirecting dockerd to a log file inside the container would clean
-   up the output.
+2. **Docker socket security.** The host Docker socket is mounted into the container,
+   giving Claude access to the host Docker daemon. Containers created by Claude run as
+   sibling containers on the host, not nested. This is mitigated by `--security-opt
+   no-new-privileges` and running as non-root, but is a weaker isolation boundary than
+   true DinD.
 
 3. **No token refresh persistence.** If Claude Code refreshes the access token inside the
    container, the new token is written to `.credentials.json` inside the container -- but
@@ -1007,10 +1025,9 @@ All other input is forwarded directly to the active session.
    and Claude Code on the host will refresh independently. In interactive mode, refreshed
    tokens persist for the container's lifetime.
 
-4. **Image size.** The `claude-dind:latest` image includes the full Docker daemon,
-   Node.js, and Claude Code. It's roughly 400-500MB. A slimmer variant without DinD
-   (just Node.js + Claude Code) could be offered for use cases that don't need Docker
-   inside the container.
+4. **Image size.** The `claude-dind:latest` image includes the Docker CLI, Node.js, and
+   Claude Code. It's lighter than the previous DinD-based image since it no longer
+   includes the full Docker daemon.
 
 5. **Detach/reattach loses sessions.** When you detach from interactive mode and
    reattach, existing Claude sessions inside the container may still be running, but

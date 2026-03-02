@@ -1,29 +1,33 @@
-# claude-dind Docker Image
+# claude-dind Docker Image (Docker-out-of-Docker)
 #
-# A Docker-in-Docker image with Claude Code installed. Designed to receive
-# OAuth credentials via stdin from the claude-dind Rust CLI on the host.
+# A Docker-out-of-Docker image with Claude Code installed. Instead of running
+# a nested Docker daemon (DinD), the host's Docker socket is bind-mounted into
+# the container so Claude can run Docker commands as sibling containers on the
+# host daemon.
 #
-# Base: docker:dind (Alpine Linux with Docker daemon + CLI)
+# Base: docker:cli (Alpine Linux with Docker CLI only — no daemon)
 # Added: Node.js, npm, Claude Code CLI, non-root user, bash, jq
 #
 # The entrypoint (entrypoint.sh) handles:
-#   1. Reading credential JSON from stdin
-#   2. Writing it to ~/.claude/.credentials.json
-#   3. Starting the Docker daemon (DinD)
+#   1. Matching the container's docker group GID to the mounted socket's GID
+#   2. Reading credential JSON from stdin (prompt mode)
+#   3. Writing it to ~/.claude/.credentials.json
 #   4. Running `claude -p <prompt>` as a non-root user
 #   5. Cleaning up credentials on exit
 #
 # Usage (via the Rust CLI — not intended to be run directly):
-#   echo '{"claudeAiOauth":...}' | docker run --privileged -i --rm \
+#   echo '{"claudeAiOauth":...}' | docker run -i --rm \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     --security-opt no-new-privileges \
 #     -e CLAUDE_PROMPT="Hello" claude-dind:latest
 #
-# Why docker:dind as the base?
+# Why docker:cli as the base?
 #   Claude Code with --dangerously-skip-permissions can execute arbitrary
-#   commands, including Docker commands. DinD provides a real Docker daemon
-#   inside the container so Claude can build/run containers as part of its
-#   work without affecting the host's Docker environment.
+#   commands, including Docker commands. By mounting the host's Docker socket,
+#   Claude can build/run containers via the host daemon without needing a
+#   privileged nested daemon. This is lighter weight and avoids --privileged.
 
-FROM docker:dind
+FROM docker:cli
 
 # Install runtime dependencies:
 #   nodejs, npm  — Required by Claude Code (it's a Node.js application)
@@ -42,13 +46,13 @@ RUN npm install -g @anthropic-ai/claude-code
 # Why? Claude Code refuses to run with --dangerously-skip-permissions as root:
 #   "cannot be used with root/sudo privileges for security reasons"
 #
-# The entrypoint runs as root (needed for starting dockerd), then drops
-# to this user via `su -l claude` for the actual Claude Code execution.
+# The entrypoint runs as root (needed for GID matching on the Docker socket),
+# then drops to this user via `su -l claude` for the actual Claude Code execution.
 #
 # - useradd -m: create home directory at /home/claude
 # - useradd -s /bin/bash: set login shell to bash
 # - sudoers entry: allow password-less sudo (for any commands Claude might need)
-# - docker group: allow Docker CLI access without sudo
+# - docker group: allow Docker CLI access to the mounted socket
 RUN useradd -m -s /bin/bash claude \
     && echo 'claude ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/claude \
     && usermod -aG docker claude 2>/dev/null || true
@@ -66,7 +70,7 @@ RUN mkdir -p /workspace && chown claude:claude /workspace
 WORKDIR /workspace
 
 # Copy the entrypoint script that orchestrates the credential injection,
-# dockerd startup, Claude execution, and cleanup.
+# Docker socket setup, Claude execution, and cleanup.
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

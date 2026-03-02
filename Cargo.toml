@@ -2,7 +2,7 @@
 name = "claude-dind"
 version = "0.1.0"
 edition = "2024"
-description = "Run Claude Code in a Docker-in-Docker container using OAuth credentials extracted from the macOS Keychain"
+description = "Run Claude Code in a Docker container with host Docker socket access using OAuth credentials extracted from the macOS Keychain"
 license = "MIT"
 repository = "https://github.com/G-structure/claude-dind"
 

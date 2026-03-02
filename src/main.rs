@@ -1,7 +1,8 @@
 //! # claude-dind
 //!
 //! A CLI tool that extracts Claude Code OAuth credentials from the macOS Keychain
-//! and runs Claude Code inside a Docker-in-Docker (DinD) container.
+//! and runs Claude Code inside a Docker container with the host's Docker socket
+//! mounted (Docker-out-of-Docker).
 //!
 //! ## Modes
 //!
@@ -11,10 +12,10 @@
 //!
 //! 1. Extracts the OAuth credential JSON from macOS Keychain using the `security` CLI.
 //! 2. Validates the JSON structure (checks for `claudeAiOauth.accessToken`).
-//! 3. Spawns a `docker run --privileged -i` process for the DinD container.
+//! 3. Spawns a `docker run -i` process with the host Docker socket mounted.
 //! 4. Pipes the credential JSON into the container's stdin, then closes the pipe (EOF).
 //! 5. The container's entrypoint reads the credentials, writes them to
-//!    `~/.claude/.credentials.json`, starts the Docker daemon, and runs
+//!    `~/.claude/.credentials.json`, matches the socket GID, and runs
 //!    `claude -p "<prompt>" --dangerously-skip-permissions`.
 //! 6. Claude's output streams directly to the user's terminal.
 //! 7. On exit, credentials are deleted inside the container, and `--rm` destroys it.
@@ -22,9 +23,10 @@
 //! ### Interactive mode (`claude-dind interactive`)
 //!
 //! A tmux-style terminal multiplexer for managing multiple Claude Code sessions
-//! running inside a single long-lived DinD container.
+//! running inside a single long-lived container.
 //!
-//! 1. Starts a long-lived DinD container with `CLAUDE_MODE=interactive`.
+//! 1. Starts a long-lived container with `CLAUDE_MODE=interactive` and the Docker
+//!    socket mounted.
 //! 2. Injects credentials via `docker exec`.
 //! 3. Launches a ratatui TUI with shadow-terminal for virtual terminal emulation.
 //! 4. Users create/switch/kill Claude sessions with tmux-style keybindings (Ctrl-b prefix).
@@ -39,6 +41,8 @@
 //!   then are explicitly deleted. The `--rm` flag destroys the container filesystem.
 //! - The prompt is passed via environment variable (`CLAUDE_PROMPT`), not stdin,
 //!   so it does not interfere with the credential pipe.
+//! - `--security-opt no-new-privileges` prevents privilege escalation inside the container.
+//! - No `--privileged` flag — the container runs with default capabilities only.
 
 mod container;
 mod credentials;
@@ -53,14 +57,18 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
+/// Default path to the Docker socket on macOS/Linux.
+const DEFAULT_DOCKER_SOCKET: &str = "/var/run/docker.sock";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "claude-dind",
     version,
-    about = "Run Claude Code in a Docker-in-Docker container with host credentials",
+    about = "Run Claude Code in a Docker container with host Docker socket access",
     long_about = "Extracts Claude Code OAuth tokens from the macOS Keychain and runs \
-                  Claude Code inside a privileged Docker-in-Docker container. Supports \
-                  both single-prompt and interactive multiplexer modes."
+                  Claude Code inside a Docker container with the host's Docker socket \
+                  mounted (Docker-out-of-Docker). Supports both single-prompt and \
+                  interactive multiplexer modes."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,6 +84,8 @@ enum Commands {
                       claude-dind prompt --build \"Write a Python hello world script\"\n\n  \
                       # Subsequent runs (image is cached):\n  \
                       claude-dind prompt \"List all files in /workspace\"\n\n  \
+                      # Mount a host directory as the workspace:\n  \
+                      claude-dind prompt -w ./my-project \"Describe the project structure\"\n\n  \
                       # Debug credential extraction:\n  \
                       claude-dind prompt --dump-creds \"ignored\"\n\n  \
                       # Keep container alive after exit for inspection:\n  \
@@ -96,6 +106,14 @@ enum Commands {
         /// Path to the docker/ context directory containing the Dockerfile.
         #[arg(long)]
         docker_context: Option<PathBuf>,
+
+        /// Host directory to mount as /workspace in the container.
+        #[arg(long, short)]
+        workspace: Option<PathBuf>,
+
+        /// Path to the Docker socket to mount into the container.
+        #[arg(long, default_value = DEFAULT_DOCKER_SOCKET)]
+        docker_socket: PathBuf,
 
         /// Additional flags to pass to `claude` inside the container.
         #[arg(long)]
@@ -119,6 +137,8 @@ enum Commands {
         after_help = "EXAMPLES:\n  \
                       # Start interactive mode (builds image if needed):\n  \
                       claude-dind interactive --build\n\n  \
+                      # Mount a host directory as the workspace:\n  \
+                      claude-dind interactive --build -w ./my-project\n\n  \
                       # Re-attach to a running container:\n  \
                       claude-dind interactive --attach abc123def456\n\n  \
                       # Keybindings (tmux-style, prefix: Ctrl-b):\n  \
@@ -141,6 +161,14 @@ enum Commands {
         /// Path to the docker/ context directory containing the Dockerfile.
         #[arg(long)]
         docker_context: Option<PathBuf>,
+
+        /// Host directory to mount as /workspace in the container.
+        #[arg(long, short)]
+        workspace: Option<PathBuf>,
+
+        /// Path to the Docker socket to mount into the container.
+        #[arg(long, default_value = DEFAULT_DOCKER_SOCKET)]
+        docker_socket: PathBuf,
 
         /// Attach to an existing running container instead of creating a new one.
         #[arg(long)]
@@ -177,6 +205,8 @@ fn run_prompt(cmd: &Commands) -> Result<i32> {
         build,
         image,
         docker_context,
+        workspace,
+        docker_socket,
         claude_flags,
         keep,
         dump_creds,
@@ -205,7 +235,23 @@ fn run_prompt(cmd: &Commands) -> Result<i32> {
 
     // Step 4: Run the container with credentials piped via stdin
     eprintln!("[claude-dind] Starting container (image: {image})...");
-    let exit_code = run_container(image, prompt, &creds, *keep, claude_flags.as_deref(), *verbose)?;
+    let socket_str = docker_socket.to_string_lossy();
+    let workspace_str = workspace.as_ref().map(|w| {
+        std::fs::canonicalize(w)
+            .unwrap_or_else(|_| w.clone())
+            .to_string_lossy()
+            .to_string()
+    });
+    let exit_code = run_container(
+        image,
+        prompt,
+        &creds,
+        *keep,
+        claude_flags.as_deref(),
+        workspace_str.as_deref(),
+        &socket_str,
+        *verbose,
+    )?;
 
     Ok(exit_code)
 }
@@ -216,6 +262,8 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
         build,
         image,
         docker_context,
+        workspace,
+        docker_socket,
         attach,
         verbose,
     } = cmd
@@ -238,11 +286,24 @@ fn run_interactive(cmd: &Commands) -> Result<i32> {
         let creds = credentials::extract_credentials()?;
         eprintln!("[claude-dind] Credentials extracted successfully.");
 
-        eprintln!("[claude-dind] Starting interactive container (image: {image})...");
-        let container = container::ContainerManager::start(image, *verbose)?;
+        let socket_str = docker_socket.to_string_lossy();
+        let workspace_str = workspace.as_ref().map(|w| {
+            std::fs::canonicalize(w)
+                .unwrap_or_else(|_| w.clone())
+                .to_string_lossy()
+                .to_string()
+        });
 
-        // Wait for dockerd to be ready
-        container.wait_for_dockerd(30)?;
+        eprintln!("[claude-dind] Starting interactive container (image: {image})...");
+        let container = container::ContainerManager::start(
+            image,
+            *verbose,
+            workspace_str.as_deref(),
+            &socket_str,
+        )?;
+
+        // Wait for container to be ready (Docker socket accessible)
+        container.wait_for_ready(10)?;
 
         // Inject credentials
         eprintln!("[claude-dind] Injecting credentials into container...");
@@ -338,16 +399,29 @@ fn run_container(
     creds_json: &str,
     keep: bool,
     claude_flags: Option<&str>,
+    workspace: Option<&str>,
+    docker_socket: &str,
     verbose: bool,
 ) -> Result<i32> {
     let mut args: Vec<String> = vec![
         "run".into(),
-        "--privileged".into(),
         "-i".into(),
+        // Mount host Docker socket for DooD
+        "-v".into(),
+        format!("{docker_socket}:/var/run/docker.sock"),
+        // Prevent privilege escalation
+        "--security-opt".into(),
+        "no-new-privileges".into(),
     ];
 
     if !keep {
         args.push("--rm".into());
+    }
+
+    // Optional workspace mount
+    if let Some(ws) = workspace {
+        args.push("-v".into());
+        args.push(format!("{ws}:/workspace"));
     }
 
     args.extend(["--env".into(), format!("CLAUDE_PROMPT={prompt}")]);
