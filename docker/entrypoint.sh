@@ -5,7 +5,7 @@
 # It supports two modes, controlled by the CLAUDE_MODE env var:
 #
 # CLAUDE_MODE=prompt (default):
-#   Orchestrates four phases:
+#   Orchestrates five phases:
 #     Phase 1: Match Docker socket GID so the claude user can access it
 #     Phase 2: Read OAuth credential JSON from stdin (piped by the Rust CLI)
 #     Phase 3: Write credentials to ~/.claude/.credentials.json
@@ -83,8 +83,8 @@ if [ "$CLAUDE_MODE" = "interactive" ]; then
     }
     trap cleanup SIGTERM SIGINT
 
-    # Sleep forever (exec replaces shell, PID 1 = sleep)
-    # Using a loop so signals are handled between iterations
+    # Sleep forever in a loop so signals are handled between iterations.
+    # Each sleep is backgrounded and waited on, allowing trap handlers to fire.
     while true; do
         sleep 86400 &
         wait $! || true
@@ -98,7 +98,7 @@ fi
 # The Rust CLI pipes the credential JSON blob, then closes stdin (EOF).
 # We use `cat` to read all of stdin into a variable.
 #
-# The `[ -t 0 ]` check detects if stdin is a terminal (interactive mode).
+# The `[ -t 0 ]` check detects if stdin is a terminal (i.e., not a pipe).
 # If someone runs the container directly without piping credentials,
 # this provides a clear error instead of hanging forever waiting for input.
 

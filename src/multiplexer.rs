@@ -116,7 +116,7 @@ enum PrefixAction {
 ///
 /// # Arguments
 ///
-/// - `container` — The running DinD container to create sessions in
+/// - `container` — The running container to create sessions in
 /// - `detach_on_exit` — If true, exit the loop when all sessions end instead of
 ///   keeping the TUI alive waiting for new sessions
 pub async fn run(container: &ContainerManager, detach_on_exit: bool) -> Result<bool> {
