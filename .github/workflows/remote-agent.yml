@@ -40,6 +40,12 @@ jobs:
     # 6-hour maximum (GitHub Actions limit)
     timeout-minutes: 360
     steps:
+      - name: Mask sensitive inputs
+        run: |
+          echo "::add-mask::${{ inputs.fingerprint }}"
+          echo "::add-mask::${{ inputs.token }}"
+          echo "::add-mask::${{ inputs.relay_token }}"
+
       - name: Checkout
         uses: actions/checkout@v4
 
