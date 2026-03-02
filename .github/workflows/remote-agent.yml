@@ -34,12 +34,11 @@ on:
         required: false
         default: 'true'
 
-# 6-hour maximum (GitHub Actions limit)
-timeout-minutes: 360
-
 jobs:
   agent:
     runs-on: ubuntu-latest
+    # 6-hour maximum (GitHub Actions limit)
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,7 +73,7 @@ jobs:
         run: |
           cd extern/gh-worker-proxy
           cargo build --release --bin gwp
-          cp target/release/gwp /usr/local/bin/gwp
+          sudo cp target/release/gwp /usr/local/bin/gwp
 
       - name: Build Docker image
         run: |
