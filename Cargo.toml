@@ -2,13 +2,21 @@
 name = "claude-dind"
 version = "0.1.0"
 edition = "2024"
+description = "Run Claude Code in a Docker-in-Docker container using OAuth credentials extracted from the macOS Keychain"
+license = "MIT"
+repository = "https://github.com/G-structure/claude-dind"
 
 [[bin]]
 name = "claude-dind"
 path = "src/main.rs"
 
 [dependencies]
+# Error handling with context chains (e.g., "Failed to execute security command: No such file")
 anyhow = "1"
+# CLI argument parsing with derive macros — generates --help, validation, etc. from struct fields
 clap = { version = "4", features = ["derive"] }
+# JSON serialization framework (serde is pulled in by serde_json, but we declare it
+# explicitly for clarity and in case we add typed deserialization later)
 serde = { version = "1", features = ["derive"] }
+# JSON parsing for validating the credential blob structure before piping it to Docker
 serde_json = "1"
